@@ -1,0 +1,18 @@
+[Unit]
+Description=SONiC Guardian Daemon - Self-Healing Security Framework
+Documentation=https://github.com/sonic-net/SONiC/wiki/Guardian
+After=sonic.target database.service
+Wants=database.service
+PartOf=sonic.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m guardian.main
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sonic-guardian
+
+[Install]
+WantedBy=sonic.target

@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with python3
+
+override_dh_auto_build:
+	dh_auto_build
+	cd debian && dh_auto_build
+
+override_dh_auto_install:
+	dh_auto_install
+	install -m 0644 debian/sonic-guardian.service $(CURDIR)/debian/sonic-guardian/lib/systemd/system/

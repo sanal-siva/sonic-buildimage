@@ -139,7 +139,7 @@ yang_files = [
     'sonic-flex_counter.yang',
     'sonic-gnmi.yang',
     'sonic-grpcclient.yang',
-    'sonic-guardian.yang',
+    'sonic-smart-patch.yang',
     'sonic-hash.yang',
     'sonic-heartbeat.yang',
     'sonic-high-frequency-telemetry.yang',

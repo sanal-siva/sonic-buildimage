@@ -1,6 +1,0 @@
-plugins/*.py usr/share/sonic-guardian/plugins
-scripts/install-plugins.py usr/share/sonic-guardian
-scripts/guardian-manifest.py usr/share/sonic-guardian
-config/50sonic-guardian-hooks etc/apt/apt.conf.d
-scripts/install-yang.py usr/share/sonic-guardian
-../sonic-yang-models/yang-models/sonic-guardian.yang usr/share/sonic-guardian/yang

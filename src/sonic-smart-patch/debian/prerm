@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl stop sonic-smart-patch.service || true
+    fi
+    python3 /usr/share/sonic-smart-patch/install-plugins.py --remove
+    python3 /usr/share/sonic-smart-patch/install-yang.py --remove
+fi
+#DEBHELPER#

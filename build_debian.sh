@@ -940,10 +940,10 @@ if [ "$BUILD_REDUCE_IMAGE_SIZE" = "y" ]; then
 fi
 
 # Embed stable identity before sealing; completed artifact hashes live outside it.
-if [ -f "$FILESYSTEM_ROOT/usr/share/sonic-guardian/guardian-manifest.py" ]; then
-    sudo python3 src/sonic-guardian/scripts/guardian-manifest.py \
+if [ -f "$FILESYSTEM_ROOT/usr/share/sonic-smart-patch/smart-patch-manifest.py" ]; then
+    sudo python3 src/sonic-smart-patch/scripts/smart-patch-manifest.py \
         --rootfs "$FILESYSTEM_ROOT" --source-revision "$(git rev-parse HEAD)" \
-        --manifest "$TARGET_PATH/guardian-${TARGET_MACHINE}.manifest.json" \
+        --manifest "$TARGET_PATH/smart-patch-${TARGET_MACHINE}.manifest.json" \
         --platform "$CONFIGURED_PLATFORM" --architecture "$CONFIGURED_ARCH" \
         --version "$SONIC_IMAGE_VERSION" --machine "$TARGET_MACHINE" \
         --installer-images "$installer_images" \

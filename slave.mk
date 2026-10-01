@@ -1996,9 +1996,9 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 		SBOM_INSTALLER_WHEELS="$($*_PYTHON_WHEELS)" \
 			./scripts/build_sbom.sh $(LOG)
 
-		if [ "$(INCLUDE_SONIC_GUARDIAN)" = "y" ]; then
-			python3 src/sonic-guardian/scripts/guardian-manifest.py \
-				--manifest "$(TARGET_PATH)/guardian-$(dep_machine).manifest.json" \
+		if [ "$(INCLUDE_SONIC_SMART_PATCH)" = "y" ]; then
+			python3 src/sonic-smart-patch/scripts/smart-patch-manifest.py \
+				--manifest "$(TARGET_PATH)/smart-patch-$(dep_machine).manifest.json" \
 				--artifact "$(TARGET_PATH)/$(subst $($*_MACHINE),$(dep_machine),$*)" $(LOG)
 		fi
 	)

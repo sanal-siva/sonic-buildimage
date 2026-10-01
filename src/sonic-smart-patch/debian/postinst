@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    install -d -m 0755 /var/lib/sonic-smart-patch /etc/sonic/smart-patch
+    python3 /usr/share/sonic-smart-patch/install-plugins.py
+    python3 /usr/share/sonic-smart-patch/install-yang.py
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
+fi
+#DEBHELPER#

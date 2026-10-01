@@ -1,0 +1,7 @@
+sonic-smart-patch (3.0.0-1) unstable; urgency=medium
+
+  * Rename package, Python module, CLI, configuration, service and build artifacts
+    to SONiC Smart Patch with a clean installation boundary.
+  * Update documentation and tests for the new public and internal names.
+
+ -- SONiC Contributors <dev@sonicdev.org>  Thu, 01 Oct 2026 05:08:10 +0000

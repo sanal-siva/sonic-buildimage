@@ -1,0 +1,47 @@
+module sonic-smart-patch {
+    yang-version 1.1;
+    namespace "http://github.com/sonic-net/sonic-smart-patch";
+    prefix smart_patch;
+    description "Resource-bounded security inventory and evidence collection.";
+    revision 2026-10-01 { description "SONiC Smart Patch package and configuration namespace."; }
+    revision 2026-09-30 { description "Configurable maintenance checks, CPU quota and free-space threshold."; }
+    revision 2026-09-29 { description "Initial Smart Patch remote-assessment configuration."; }
+    container sonic-smart-patch {
+        container SONIC_SMART_PATCH {
+            container GLOBAL {
+                leaf enabled { type boolean; default false; }
+                leaf mode { type enumeration { enum advisory; enum assisted; enum autonomous; } default advisory; }
+                leaf service_url { type string { pattern 'https?://[^ ]+'; } }
+                leaf allow_http { type boolean; default false; description "Explicit isolated-lab exception to TLS."; }
+                leaf ca_bundle { type string; description "Trusted CA PEM path; certificate verification is always enabled."; }
+                leaf sync_interval { type uint32 { range "10..86400"; } default 60; }
+                leaf inventory_interval { type uint32 { range "10..86400"; } default 900; }
+                leaf min_available_mb { type uint32 { range "64..65536"; } default 256; }
+                leaf max_components { type uint32 { range "1..20000"; } default 20000; }
+                leaf maintenance_checks_enabled {
+                    type boolean;
+                    default false;
+                    description "Enable local maintenance preflight and health checks. When false, missing rollback artifacts and failed optional checks do not block maintenance. Authentication, operating mode, explicit approval and supported host-package boundaries still apply.";
+                }
+                leaf maintenance_cpu_quota_percent {
+                    type uint8 { range "0..100"; }
+                    default 0;
+                    description "CPU quota for package maintenance as a percentage of one CPU. Zero disables the maintenance quota; normal collector limits remain separate.";
+                }
+                leaf maintenance_min_free_mib {
+                    type uint32 { range "1..65536"; }
+                    default 500;
+                    description "Minimum free space in MiB on the package staging filesystem, checked before staging and installation when maintenance_checks_enabled is true.";
+                }
+                leaf validation_services { type string { length "1..1024"; } default "ssh,database,swss,syncd,bgp"; }
+                leaf validation_cpu_max_pct { type uint8 { range "1..100"; } default 80; }
+                leaf validation_memory_max_pct { type uint8 { range "1..100"; } default 90; }
+                leaf validation_disk_max_pct { type uint8 { range "1..100"; } default 85; }
+                leaf validation_prefix_loss_pct { type uint8 { range "0..100"; } default 0; }
+                leaf validation_require_prefix_counts { type boolean; default true; }
+                leaf validation_disk_path { type string; default "/var/lib/sonic-smart-patch"; }
+                leaf autonomous_allowlist { type string; description "Comma-separated exact scope/package names approved for staged low-impact transactions."; }
+            }
+        }
+    }
+}

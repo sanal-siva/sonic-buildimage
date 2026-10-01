@@ -1,6 +1,3 @@
-grype==0.65.0
-requests==2.28.1
-pyyaml==6.0
-click==8.1.3
-sonic-py-swscommon>=20220830
-sonic-py-yang>=202211
+requests>=2.28
+PyYAML>=6
+click>=8

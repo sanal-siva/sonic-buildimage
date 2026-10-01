@@ -4,7 +4,7 @@ A framework for continuous vulnerability discovery, intelligent risk assessment,
 and autonomous remediation in SONiC network operating systems.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "SONiC Contributors"
 __license__ = "Apache 2.0"
 

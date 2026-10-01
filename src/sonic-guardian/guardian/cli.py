@@ -1,641 +1,285 @@
-"""SONiC Guardian CLI commands using Click framework"""
-
+"""Native and standalone Guardian CLI. Collection is read-only by default."""
 import json
+from datetime import datetime, timezone
 import click
-from typing import Dict, List, Any
+from guardian.agent import Agent
+from guardian.config import ConfigManager, public_config
+from guardian.storage import StateStore, read_public_state
+from guardian.lifecycle import set_enabled, set_mode
 
-from guardian.scanner import VulnerabilityScanner
-from guardian.metadata import MetadataManager
-from guardian.config import ConfigManager
-from guardian.intelligence import IntelligenceServiceClient
-from guardian.remediation import RemediationEngine
-from guardian.validation import ValidationEngine
-from guardian.rollback import RollbackEngine
-from guardian.vex import VEXManager
-from guardian.logging import setup_logging
 
-logger = setup_logging(__name__)
+def output(value):
+    click.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+def guarded(function):
+    from functools import wraps
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except (ValueError, OSError, RuntimeError) as error:
+            raise click.ClickException(str(error))
+    return wrapper
 
 
 @click.group()
 def security():
-    """SONiC Guardian security commands"""
-    pass
+    """SONiC Guardian: inventory, evidence, findings and maintenance."""
 
 
 @security.group()
 def config():
-    """Configure SONiC Guardian"""
-    pass
+    """Configure Guardian (persisted in ConfigDB and on disk)."""
 
 
-@security.group()
-def show():
-    """Display security information"""
-    pass
+@config.group(name="guardian", invoke_without_command=True)
+@click.option("--enable", is_flag=True)
+@click.option("--disable", is_flag=True)
+@click.option("--mode", type=click.Choice(["advisory", "assisted", "autonomous"]))
+@guarded
+def configure_guardian(enable, disable, mode):
+    if enable and disable:
+        raise click.ClickException("Choose enable or disable")
+    manager = ConfigManager()
+    if enable or disable:
+        set_enabled(enable, config=manager)
+    if mode:
+        set_mode(mode, config=manager)
 
 
-@security.group(name="scan")
-def security_scan():
-    """Vulnerability scanning operations"""
-    pass
+@configure_guardian.command(name="enable")
+@guarded
+def enable_guardian():
+    managed = set_enabled(True)
+    click.echo("Guardian enabled; service started and enabled at boot" if managed else "Guardian enabled in standalone configuration")
+
+
+@configure_guardian.command(name="disable")
+@guarded
+def disable_guardian():
+    managed = set_enabled(False)
+    click.echo("Guardian disabled; service stopped and disabled at boot" if managed else "Guardian disabled in standalone configuration")
+
+
+@configure_guardian.command(name="mode")
+@click.argument("mode", type=click.Choice(["advisory", "assisted", "autonomous"]))
+@guarded
+def guardian_mode(mode):
+    set_mode(mode)
+    click.echo("Guardian operating mode saved")
 
 
 @config.command(name="service-url")
 @click.argument("url")
-def config_service_url(url):
-    """Configure Security Intelligence Service URL"""
-    try:
-        config_mgr = ConfigManager()
-        if config_mgr.set_service_url(url):
-            click.echo(f"Service URL configured: {url}")
-        else:
-            click.echo("ERROR: Failed to configure service URL", err=True)
-            raise SystemExit(1)
-    except Exception as e:
-        logger.error(f"Configuration failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
+@guarded
+def service_url(url):
+    ConfigManager().set_service_url(url)
+    click.echo("Service URL saved")
 
 
 @config.command(name="auth-token")
-@click.argument("token")
-def config_auth_token(token):
-    """Configure Security Intelligence Service authentication token"""
-    try:
-        config_mgr = ConfigManager()
-        if config_mgr.set_auth_token(token):
-            click.echo("Auth token configured")
-        else:
-            click.echo("ERROR: Failed to configure auth token", err=True)
-            raise SystemExit(1)
-    except Exception as e:
-        logger.error(f"Configuration failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@config.command(name="guardian")
-@click.option(
-    "--mode",
-    type=click.Choice(["advisory", "assisted", "autonomous"]),
-    help="Operating mode",
-)
-@click.option("--enable", is_flag=True, help="Enable Guardian")
-@click.option("--disable", is_flag=True, help="Disable Guardian")
-def config_guardian(mode, enable, disable):
-    """Configure SONiC Guardian service"""
-    try:
-        config_mgr = ConfigManager()
-
-        if enable:
-            if config_mgr.set_service_enabled(True):
-                click.echo("SONiC Guardian enabled")
-            else:
-                click.echo("ERROR: Failed to enable Guardian", err=True)
-                raise SystemExit(1)
-
-        if disable:
-            if config_mgr.set_service_enabled(False):
-                click.echo("SONiC Guardian disabled")
-            else:
-                click.echo("ERROR: Failed to disable Guardian", err=True)
-                raise SystemExit(1)
-
-        if mode:
-            if config_mgr.set_operating_mode(mode):
-                click.echo(f"Operating mode set to: {mode}")
-            else:
-                click.echo("ERROR: Failed to set operating mode", err=True)
-                raise SystemExit(1)
-    except Exception as e:
-        logger.error(f"Configuration failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security_scan.command(name="now")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def scan_now(output_json):
-    """Execute immediate vulnerability scan"""
-    try:
-        click.echo("Starting vulnerability scan...")
-        metadata_mgr = MetadataManager()
-        config_mgr = ConfigManager()
-
-        sbom_source = config_mgr.get_sbom_source()
-        scanner = VulnerabilityScanner(sbom_source, metadata_mgr)
-
-        scanner.load_sbom()
-        vulnerabilities = scanner.scan_packages()
-        new_vulns, all_vulns = scanner.deduplicate_vulnerabilities(vulnerabilities)
-
-        scan_result = {
-            "cve_count": len(all_vulns),
-            "new_cves": len(new_vulns),
-            "severity_breakdown": _count_by_severity(all_vulns),
-            "vulnerabilities": [v.to_dict() for v in all_vulns],
-        }
-
-        metadata_mgr.add_scan_result(scan_result)
-        _output_scan_results(scan_result, output_json)
-    except Exception as e:
-        logger.error(f"Scan failed: {e}")
-        click.echo(f"ERROR: Scan failed: {e}", err=True)
-        raise SystemExit(1)
-
-
-@show.command(name="vulnerabilities")
-@click.option(
-    "--severity",
-    type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
-    help="Filter by severity level",
-)
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def show_vulnerabilities(severity, output_json):
-    """Display vulnerabilities from last scan"""
-    try:
-        metadata_mgr = MetadataManager()
-        metadata = metadata_mgr.load()
-        last_scan = metadata["scan_history"][-1] if metadata["scan_history"] else None
-
-        if not last_scan:
-            click.echo("No vulnerabilities found (no scan history)")
-            return
-
-        vulns = last_scan.get("vulnerabilities", [])
-
-        if severity:
-            vulns = [v for v in vulns if v["severity"] == severity]
-
-        if output_json:
-            click.echo(json.dumps(vulns, indent=2))
-        else:
-            _print_vulnerabilities_table(vulns)
-    except Exception as e:
-        logger.error(f"Failed to show vulnerabilities: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@show.command(name="vulnerability")
-@click.argument("cve_id")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def show_vulnerability(cve_id, output_json):
-    """Display details for specific CVE"""
-    try:
-        metadata_mgr = MetadataManager()
-        metadata = metadata_mgr.load()
-        last_scan = metadata["scan_history"][-1] if metadata["scan_history"] else None
-
-        if not last_scan:
-            click.echo(f"CVE {cve_id} not found")
-            return
-
-        vulns = last_scan.get("vulnerabilities", [])
-        vuln = next((v for v in vulns if v["cve_id"] == cve_id), None)
-
-        if not vuln:
-            click.echo(f"CVE {cve_id} not found")
-            raise SystemExit(1)
-
-        if output_json:
-            click.echo(json.dumps(vuln, indent=2))
-        else:
-            _print_vulnerability_details(vuln)
-    except Exception as e:
-        logger.error(f"Failed to show CVE details: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-def _count_by_severity(vulnerabilities: List[Any]) -> Dict[str, int]:
-    """Count vulnerabilities by severity"""
-    breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for vuln in vulnerabilities:
-        severity = vuln.severity.value if hasattr(vuln.severity, "value") else vuln["severity"]
-        breakdown[severity] = breakdown.get(severity, 0) + 1
-    return breakdown
-
-
-def _output_scan_results(scan_result: Dict[str, Any], json_output: bool) -> None:
-    """Output scan results in requested format"""
-    if json_output:
-        click.echo(json.dumps(scan_result, indent=2))
-    else:
-        click.echo("\nScan Results:")
-        click.echo("=============")
-        click.echo(f"Total packages scanned: ~150")
-        click.echo(f"Vulnerabilities found: {scan_result['cve_count']}")
-        click.echo(f"  - New: {scan_result['new_cves']}")
-        click.echo(f"  - Previously reported: {scan_result['cve_count'] - scan_result['new_cves']}")
-        click.echo("\nSeverity breakdown:")
-        for severity, count in scan_result["severity_breakdown"].items():
-            click.echo(f"  - {severity}: {count}")
-
-
-def _print_vulnerabilities_table(vulnerabilities: List[Dict]) -> None:
-    """Print vulnerabilities as ASCII table"""
-    click.echo("\nVulnerabilities:")
-    click.echo("-" * 80)
-    click.echo(f"{'CVE':<20} {'Package':<20} {'Severity':<10} {'CVSS':<6}")
-    click.echo("-" * 80)
-    for v in vulnerabilities:
-        click.echo(
-            f"{v['cve_id']:<20} {v['package_name']:<20} {v['severity']:<10} {v['cvss_score']:<6.1f}"
-        )
-
-
-def _print_vulnerability_details(vuln: Dict[str, Any]) -> None:
-    """Print detailed CVE information"""
-    click.echo(f"\nCVE: {vuln['cve_id']}")
-    click.echo(f"Package: {vuln['package_name']}")
-    click.echo(f"Affected Version: {vuln['affected_version']}")
-    click.echo(f"Fixed Version: {vuln.get('fixed_version', 'Unknown')}")
-    click.echo(f"Severity: {vuln['severity']}")
-    click.echo(f"CVSS Score: {vuln['cvss_score']:.1f}")
-
-
-@show.command(name="guardian")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def show_guardian_status(output_json):
-    """Display Guardian service status and configuration"""
-    try:
-        config_mgr = ConfigManager()
-        metadata_mgr = MetadataManager()
-
-        status = {
-            "enabled": config_mgr.get_service_enabled(),
-            "mode": config_mgr.get_operating_mode(),
-            "service_url": config_mgr.get_service_url() or "Not configured",
-            "sbom_source": config_mgr.get_sbom_source(),
-        }
-
-        metadata = metadata_mgr.load()
-        status["last_scan"] = (
-            metadata["scan_history"][-1].get("timestamp")
-            if metadata.get("scan_history")
-            else None
-        )
-        status["total_scans"] = len(metadata.get("scan_history", []))
-
-        if output_json:
-            click.echo(json.dumps(status, indent=2))
-        else:
-            click.echo("\nSONiC Guardian Status:")
-            click.echo("=" * 50)
-            click.echo(f"Enabled: {'Yes' if status['enabled'] else 'No'}")
-            click.echo(f"Mode: {status['mode']}")
-            click.echo(f"Service URL: {status['service_url']}")
-            click.echo(f"SBOM Source: {status['sbom_source']}")
-            click.echo(f"Total Scans: {status['total_scans']}")
-            if status["last_scan"]:
-                click.echo(f"Last Scan: {status['last_scan']}")
-    except Exception as e:
-        logger.error(f"Failed to show status: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="assess")
-@click.argument("cve_id")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def assess_vulnerability(cve_id, output_json):
-    """Request risk assessment from Intelligence Service for specific CVE"""
-    try:
-        config_mgr = ConfigManager()
-        service_url = config_mgr.get_service_url()
-        auth_token = config_mgr.get_auth_token()
-
-        if not service_url or not auth_token:
-            click.echo("ERROR: Intelligence Service not configured", err=True)
-            raise SystemExit(1)
-
-        click.echo(f"Assessing {cve_id}...")
-
-        metadata_mgr = MetadataManager()
-        metadata = metadata_mgr.load()
-
-        # Find CVE in scan history
-        cve_data = None
-        for scan in metadata.get("scan_history", []):
-            for vuln in scan.get("vulnerabilities", []):
-                if vuln.get("cve_id") == cve_id:
-                    cve_data = vuln
-                    break
-
-        if not cve_data:
-            click.echo(f"CVE {cve_id} not found in scan history", err=True)
-            raise SystemExit(1)
-
-        # Request assessment
-        client = IntelligenceServiceClient(service_url, auth_token)
-        recommendations = client.assess_vulnerabilities(
-            [cve_data],
-            config_mgr.get("SERVICE", "sonic-guardian", "sonic_version") or "unknown",
-        )
-
-        if recommendations:
-            rec = recommendations[0]
-            if output_json:
-                click.echo(json.dumps(rec.to_dict(), indent=2))
-            else:
-                click.echo(f"\nAssessment for {cve_id}:")
-                click.echo(f"Risk Score: {rec.risk_score:.1f}/10")
-                click.echo(f"Recommended Action: {rec.action_type}")
-                click.echo(f"Confidence: {rec.confidence * 100:.0f}%")
-                click.echo(f"Expected Downtime: {rec.expected_downtime_minutes} minutes")
-                click.echo(f"Rationale: {rec.rationale}")
-    except Exception as e:
-        logger.error(f"Assessment failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="remediate")
-@click.argument("package_name")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def remediate_package(package_name, output_json):
-    """Remediate vulnerability by updating package"""
-    try:
-        config_mgr = ConfigManager()
-        mode = config_mgr.get_operating_mode()
-
-        if mode == "advisory":
-            click.echo("ERROR: Remediation not allowed in Advisory mode", err=True)
-            raise SystemExit(1)
-
-        click.echo(f"Remediating {package_name}...")
-
-        remediation_engine = RemediationEngine()
-        validation_engine = ValidationEngine()
-
-        # Download package
-        if not remediation_engine.download_package(package_name):
-            click.echo(f"ERROR: Failed to download {package_name}", err=True)
-            raise SystemExit(1)
-
-        # Install package
-        if not remediation_engine.install_package(package_name):
-            click.echo(f"ERROR: Failed to install {package_name}", err=True)
-
-            # Attempt rollback
-            rollback_engine = RollbackEngine()
-            click.echo("Attempting rollback...")
-            raise SystemExit(1)
-
-        # Validate health
-        all_passed, results = validation_engine.run_health_checks()
-
-        if not all_passed:
-            click.echo("WARNING: Health checks failed, triggering rollback...", err=True)
-            rollback_engine = RollbackEngine()
-            if rollback_engine.trigger_rollback(package_name, "previous"):
-                click.echo("Rollback successful")
-            raise SystemExit(1)
-
-        click.echo(f"Successfully remediated {package_name}")
-
-        if output_json:
-            click.echo(json.dumps({"status": "success", "package": package_name}, indent=2))
-    except Exception as e:
-        logger.error(f"Remediation failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="validate")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def validate_system(output_json):
-    """Run standalone health checks"""
-    try:
-        click.echo("Running health checks...")
-
-        validation_engine = ValidationEngine()
-        all_passed, results = validation_engine.run_health_checks()
-
-        if output_json:
-            results_data = [r.to_dict() for r in results]
-            click.echo(json.dumps({"passed": all_passed, "results": results_data}, indent=2))
-        else:
-            click.echo("\nHealth Check Results:")
-            click.echo("=" * 50)
-            for result in results:
-                status_icon = "✓" if result.status == "PASS" else "✗"
-                click.echo(f"{status_icon} {result.check_type}: {result.status}")
-                if result.details:
-                    for key, value in result.details.items():
-                        click.echo(f"    {key}: {value}")
-
-            click.echo("=" * 50)
-            overall = "PASS" if all_passed else "FAIL"
-            click.echo(f"Overall: {overall}")
-    except Exception as e:
-        logger.error(f"Validation failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="rollback")
-@click.argument("package_name")
-def rollback_package(package_name):
-    """Manually rollback package to previous version"""
-    try:
-        click.echo(f"Rolling back {package_name}...")
-
-        rollback_engine = RollbackEngine()
-        if rollback_engine.trigger_rollback(package_name, "previous"):
-            click.echo(f"Successfully rolled back {package_name}")
-        else:
-            click.echo(f"ERROR: Rollback failed for {package_name}", err=True)
-            raise SystemExit(1)
-    except Exception as e:
-        logger.error(f"Rollback failed: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@show.group(name="vex")
-def show_vex():
-    """Display VEX (Vulnerability Exploitability Exchange) information"""
-    pass
-
-
-@show_vex.command(name="records")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def show_vex_records(output_json):
-    """Display VEX records for non-impacted CVEs"""
-    try:
-        vex_mgr = VEXManager()
-        config_mgr = ConfigManager()
-
-        sonic_version = config_mgr.get("SERVICE", "sonic-guardian", "sonic_version") or "unknown"
-        records = vex_mgr.load_vex_records(sonic_version)
-
-        if output_json:
-            records_data = [r.to_dict() for r in records]
-            click.echo(json.dumps(records_data, indent=2))
-        else:
-            if not records:
-                click.echo("No VEX records found")
-                return
-
-            click.echo(f"\nVEX Records (Non-Impacted CVEs) - SONiC {sonic_version}:")
-            click.echo("-" * 100)
-            click.echo(f"{'CVE':<20} {'Package':<20} {'Verdict':<20} {'Confidence':<12}")
-            click.echo("-" * 100)
-            for rec in records:
-                click.echo(
-                    f"{rec.vulnerability_id:<20} {rec.package_name:<20} {rec.verdict:<20} {rec.tool_confidence*100:<12.0f}%"
-                )
-    except Exception as e:
-        logger.error(f"Failed to show VEX records: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@show_vex.command(name="document")
-@click.option("--format", type=click.Choice(["json", "sbom"]), default="json")
-def show_vex_document(format):
-    """Display complete VEX document"""
-    try:
-        vex_mgr = VEXManager()
-        config_mgr = ConfigManager()
-
-        sonic_version = config_mgr.get("SERVICE", "sonic-guardian", "sonic_version") or "unknown"
-        records = vex_mgr.load_vex_records(sonic_version)
-
-        if format == "sbom":
-            doc = vex_mgr.export_vex_sbom(records)
-        else:
-            doc = {
-                "format": "CycloneDX",
-                "version": "1.4",
-                "sonic_version": sonic_version,
-                "records_count": len(records),
-                "records": [r.to_dict() for r in records],
-            }
-
-        click.echo(json.dumps(doc, indent=2))
-    except Exception as e:
-        logger.error(f"Failed to show VEX document: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="mark-non-impacted")
-@click.argument("cve_id")
-@click.argument("package_name")
-@click.option("--rationale", default="Not vulnerable in this context")
-def mark_non_impacted(cve_id, package_name, rationale):
-    """Mark a CVE as non-impacted and create VEX record"""
-    try:
-        vex_mgr = VEXManager()
-        metadata_mgr = MetadataManager()
-
-        click.echo(f"Creating VEX record for {cve_id} in {package_name}...")
-
-        # Create VEX record
-        vex_record = vex_mgr.record_non_impacted_cve(cve_id, package_name, rationale)
-
-        # Add to metadata
-        metadata_mgr.add_vex_record(vex_record.to_dict())
-
-        click.echo(f"VEX record created: {cve_id} marked as non-impacted")
-    except Exception as e:
-        logger.error(f"Failed to create VEX record: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@security.command(name="generate-vex")
-@click.option("--output", default=None, help="Output file path")
-def generate_vex(output):
-    """Generate comprehensive VEX document for current SONiC version"""
-    try:
-        config_mgr = ConfigManager()
-        metadata_mgr = MetadataManager()
-        vex_mgr = VEXManager()
-
-        sonic_version = config_mgr.get("SERVICE", "sonic-guardian", "sonic_version") or "unknown"
-        click.echo(f"Generating VEX document for SONiC {sonic_version}...")
-
-        metadata = metadata_mgr.load()
-        last_scan = metadata["scan_history"][-1] if metadata.get("scan_history") else None
-
-        if not last_scan:
-            click.echo("No scan results available for VEX generation", err=True)
-            raise SystemExit(1)
-
-        vulns = last_scan.get("vulnerabilities", [])
-
-        # Create VEX document
-        vex_doc = vex_mgr.create_vex_document(sonic_version, vulns)
-
-        # Update with existing VEX records
-        existing_records = vex_mgr.load_vex_records(sonic_version)
-        vex_doc = vex_mgr.update_vex_document(vex_doc, existing_records)
-
-        # Write to file
-        if output:
-            import pathlib
-            pathlib.Path(output).write_text(json.dumps(vex_doc, indent=2))
-            click.echo(f"VEX document written to: {output}")
-        else:
-            vex_path = vex_mgr.generate_vex_file(vex_doc)
-            click.echo(f"VEX document generated: {vex_path}")
-    except Exception as e:
-        logger.error(f"Failed to generate VEX document: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
-
-
-@show.command(name="recommendations")
-@click.option("--json", "output_json", is_flag=True, help="JSON output format")
-def show_recommendations(output_json):
-    """Display remediation recommendations"""
-    try:
-        config_mgr = ConfigManager()
-        metadata_mgr = MetadataManager()
-
-        service_url = config_mgr.get_service_url()
-        auth_token = config_mgr.get_auth_token()
-
-        if not service_url or not auth_token:
-            click.echo("ERROR: Intelligence Service not configured", err=True)
-            raise SystemExit(1)
-
-        metadata = metadata_mgr.load()
-        last_scan = metadata["scan_history"][-1] if metadata.get("scan_history") else None
-
-        if not last_scan:
-            click.echo("No scan results available")
-            return
-
-        vulns = last_scan.get("vulnerabilities", [])
-
-        # Get recommendations from Intelligence Service
-        client = IntelligenceServiceClient(service_url, auth_token)
-        recommendations = client.assess_vulnerabilities(vulns, "unknown")
-
-        if output_json:
-            recs_data = [r.to_dict() for r in recommendations]
-            click.echo(json.dumps(recs_data, indent=2))
-        else:
-            click.echo("\nRecommendations:")
-            click.echo("-" * 100)
-            click.echo(
-                f"{'Package':<20} {'CVE':<20} {'Action':<20} {'Risk':<8} {'Confidence':<12}"
-            )
-            click.echo("-" * 100)
-            for rec in recommendations:
-                click.echo(
-                    f"{rec.package_name:<20} {rec.cve_id:<20} {rec.action_type:<20} {rec.risk_score:<8.1f} {rec.confidence*100:<12.0f}%"
-                )
-    except Exception as e:
-        logger.error(f"Failed to show recommendations: {e}")
-        click.echo(f"ERROR: {e}", err=True)
-        raise SystemExit(1)
+@click.option("--token-file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("token", required=False)
+@guarded
+def auth_token(token_file, token):
+    from pathlib import Path
+    value = Path(token_file).read_text().strip() if token_file else token or click.prompt("Device token", hide_input=True)
+    ConfigManager().set_auth_token(value)
+    click.echo("Device token stored in a root-only file")
+
+
+@config.command(name="setting")
+@click.argument("name", type=click.Choice(["ca_bundle", "sync_interval", "inventory_interval", "min_available_mb", "allow_http", "autonomous_allowlist", "maintenance_cpu_quota_percent", "maintenance_min_free_mib", "maintenance_checks_enabled", "validation_services", "validation_cpu_max_pct", "validation_memory_max_pct", "validation_disk_max_pct", "validation_disk_path", "validation_prefix_loss_pct", "validation_require_prefix_counts"]))
+@click.argument("value")
+@guarded
+def setting(name, value):
+    """Save a setting; maintenance checks default false, CPU 0 is unlimited, disk in MiB."""
+    if name.endswith("interval") and not 10 <= int(value) <= 86400:
+        raise ValueError("Interval must be between 10 and 86400 seconds")
+    if name == "min_available_mb" and not 64 <= int(value) <= 65536:
+        raise ValueError("Memory threshold must be between 64 and 65536 MiB")
+    if name == "maintenance_cpu_quota_percent" and not 0 <= int(value) <= 100:
+        raise ValueError("Maintenance CPU quota must be between 0 and 100 percent; 0 disables the quota")
+    if name == "maintenance_min_free_mib" and not 1 <= int(value) <= 65536:
+        raise ValueError("Maintenance free space must be between 1 and 65536 MiB")
+    if name == "maintenance_checks_enabled" and value not in ("true", "false"):
+        raise ValueError("Maintenance checks must be true or false")
+    if name.endswith("_max_pct") and not 1 <= int(value) <= 100:
+        raise ValueError("Validation percentage must be between 1 and 100")
+    if name == "validation_prefix_loss_pct" and not 0 <= int(value) <= 100:
+        raise ValueError("Prefix loss tolerance must be between 0 and 100")
+    if name == "validation_require_prefix_counts" and value not in ("true", "false"):
+        raise ValueError("Prefix count requirement must be true or false")
+    if name == "validation_services":
+        import re
+        services = value.split(",")
+        if not 1 <= len(services) <= 16 or any(not re.fullmatch(r"[A-Za-z0-9_.@:-]+", item) for item in services):
+            raise ValueError("Supply 1-16 explicit systemd service names")
+    if name == "allow_http" and value not in ("true", "false"):
+        raise ValueError("allow_http must be true or false")
+    ConfigManager().set("", "", name, value)
+    click.echo("Setting saved")
+
+
+@security.group()
+def show():
+    """Show measured state, current findings and collection coverage."""
+
+
+@show.command(name="status")
+@click.option("--json", "as_json", is_flag=True)
+@guarded
+def status(as_json):
+    state = read_public_state()
+    result = {key: state.get(key) for key in ("sync_status", "assessment_status", "assessment_revision", "last_sync", "collected_at", "error", "inventory_digest", "assessed_inventory_digest", "findings_total", "findings_truncated", "coverage", "clock_alignment", "cache_status", "retained_last_known_count", "cache_omitted_count", "expired_or_unverifiable_verdicts")}
+    result.update(components=state.get("component_count", 0), findings=len(state.get("findings", [])), scopes=state.get("scopes", []))
+    config = public_config()
+    result["enabled"] = config["enabled"]
+    result["mode"] = config["mode"]
+    result["maintenance_checks_enabled"] = config["maintenance_checks_enabled"]
+    result["fresh"] = False
+    if state.get("last_sync"):
+        age = (datetime.now(timezone.utc)-datetime.fromisoformat(state["last_sync"])).total_seconds()
+        result["age_seconds"] = round(age)
+        result["fresh"] = age < max(120, int(config["sync_interval"])*3) and state.get("sync_status") == "connected"
+    output(result)
+
+
+@show.command(name="findings")
+@click.option("--severity", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"], case_sensitive=False))
+@click.option("--json", "as_json", is_flag=True)
+@guarded
+def findings(severity, as_json):
+    state = read_public_state()
+    items = state.get("findings", [])
+    if severity:
+        items = [item for item in items if item.get("severity", "").upper() == severity.upper()]
+    if as_json:
+        output(items)
+        return
+    click.echo("Assessment: %s; connection: %s; last sync: %s" % (state.get("assessment_status", "unassessed"), state.get("sync_status", "never_connected"), state.get("last_sync", "never")))
+    if state.get("findings_truncated"):
+        click.echo("Local cache contains %d rows; service reports %d current findings. Use the service for complete coverage." % (len(items), state.get("findings_total", len(items))))
+    if state.get("retained_last_known_count"):
+        click.echo("Last-known observations retained: %d; partial coverage does not establish their current applicability." % state["retained_last_known_count"])
+    if not items:
+        click.echo("No current findings available; inspect status and coverage before interpreting this result.")
+    for item in items:
+        click.echo("%s  %-18s %-10s %-20s %s %s [%s]" % (item.get("id", "?"), item.get("cve_id", "?"), item.get("severity", "unknown"), item.get("applicability", "under_investigation"), item.get("scope", "?"), item.get("package_name", "?"), item.get("cache_state", "unknown")))
+        if item.get("decision_basis") == "inventory_advisory_match":
+            click.echo("  Inventory/advisory match; build unverified; scoped operator review required before remediation.")
+
+
+show.add_command(findings, "vulnerabilities")
+
+
+@show.command(name="finding")
+@click.argument("finding_id")
+@guarded
+def finding(finding_id):
+    matches = [item for item in read_public_state().get("findings", []) if item.get("id") == finding_id or item.get("cve_id") == finding_id]
+    if not matches:
+        raise ValueError("Finding not present in the current local assessment")
+    output(matches)
+
+
+show.add_command(finding, "evidence")
+show.add_command(finding, "vulnerability")
+
+
+@show.command(name="inventory-drift")
+@guarded
+def drift():
+    state = read_public_state()
+    pending = state.get("pending_summary", {})
+    output({"epoch": state.get("epoch"), "acknowledged_sequence": state.get("sequence"), "pending_kind": pending.get("kind"), "pending_upserts": pending.get("upserts", 0), "pending_removals": pending.get("removals", 0), "scopes": state.get("scopes", [])})
+
+
+@show.command(name="resource-usage")
+@guarded
+def resources():
+    output(read_public_state().get("resources", {}))
+
+
+@security.group(name="scan")
+def scan():
+    """Request central assessment by syncing lightweight inventory."""
+
+
+@scan.command(name="now")
+@click.option("--json", "as_json", is_flag=True)
+@guarded
+def scan_now(as_json):
+    result = Agent().sync(force=True)
+    output(result)
+
+
+@security.command(name="sync")
+@click.option("--force", is_flag=True)
+@guarded
+def sync(force):
+    output(Agent().sync(force=force))
+
+
+@security.command(name="collect")
+@guarded
+def collect():
+    from guardian.collector import InventoryCollector
+    output(InventoryCollector().collect())
+
+
+@security.group(name="maintenance")
+def maintenance():
+    """Create, stage and execute exact-version, scope-specific plans."""
+
+
+@maintenance.command(name="plan")
+@click.argument("finding_id")
+@click.argument("target_version")
+@guarded
+def plan(finding_id, target_version):
+    from guardian.remediation import RemediationEngine
+    output(RemediationEngine().create_plan(finding_id, target_version))
+
+
+@maintenance.command(name="stage")
+@click.argument("plan_id")
+@guarded
+def stage(plan_id):
+    from guardian.remediation import RemediationEngine
+    output(RemediationEngine().stage(plan_id))
+
+
+@maintenance.command(name="apply")
+@click.argument("plan_id")
+@click.option("--approve", is_flag=True, help="Approve this exact staged plan")
+@guarded
+def apply(plan_id, approve):
+    from guardian.remediation import RemediationEngine
+    output(RemediationEngine().apply(plan_id, approved=approve))
+
+
+@maintenance.command(name="rollback")
+@click.argument("plan_id")
+@click.option("--approve", is_flag=True)
+@guarded
+def rollback(plan_id, approve):
+    if not approve:
+        raise ValueError("Explicit --approve is required for rollback")
+    from guardian.remediation import RemediationEngine
+    output(RemediationEngine().rollback(plan_id))
+
+
+@security.command(name="export-vex")
+@click.option("--output", "filename", default="guardian-vex.json")
+@guarded
+def export_vex(filename):
+    from guardian.vex import VEXManager
+    state = StateStore().load()
+    manager = VEXManager()
+    document = manager.create_vex_document(state.get("build_id", "unknown"), state.get("findings", []), clock_alignment=state.get("clock_alignment", {}))
+    click.echo(str(manager.generate_vex_file(document, filename)))
 
 
 if __name__ == "__main__":

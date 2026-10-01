@@ -939,6 +939,22 @@ if [ "$BUILD_REDUCE_IMAGE_SIZE" = "y" ]; then
       --remove-licenses
 fi
 
+# Embed stable identity before sealing; completed artifact hashes live outside it.
+if [ -f "$FILESYSTEM_ROOT/usr/share/sonic-guardian/guardian-manifest.py" ]; then
+    sudo python3 src/sonic-guardian/scripts/guardian-manifest.py \
+        --rootfs "$FILESYSTEM_ROOT" --source-revision "$(git rev-parse HEAD)" \
+        --manifest "$TARGET_PATH/guardian-${TARGET_MACHINE}.manifest.json" \
+        --platform "$CONFIGURED_PLATFORM" --architecture "$CONFIGURED_ARCH" \
+        --version "$SONIC_IMAGE_VERSION" --machine "$TARGET_MACHINE" \
+        --installer-images "$installer_images" \
+        --build-parameter "image_type=$IMAGE_TYPE" \
+        --build-parameter "machine=$TARGET_MACHINE" \
+        --build-parameter "debian_distro=$IMAGE_DISTRO" \
+        --build-parameter "debug_image=$DEBUG_IMG" \
+        --build-parameter "reduce_image_size=$BUILD_REDUCE_IMAGE_SIZE" \
+        --build-parameter "enable_sbom=$ENABLE_SBOM"
+fi
+
 sudo mksquashfs $FILESYSTEM_ROOT $FILESYSTEM_SQUASHFS -comp zstd -b 1M -e boot -e var/lib/docker -e $PLATFORM_DIR
 
 ## Reduce /boot permission

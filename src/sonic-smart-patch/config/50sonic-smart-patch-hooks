@@ -1,0 +1,2 @@
+// Hooks only mark inventory dirty. Reconciliation runs after package transactions.
+DPkg::Post-Invoke { "/usr/bin/python3 -m smart_patch.hooks || true"; };

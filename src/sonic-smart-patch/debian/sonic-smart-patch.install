@@ -1,0 +1,6 @@
+plugins/*.py usr/share/sonic-smart-patch/plugins
+scripts/install-plugins.py usr/share/sonic-smart-patch
+scripts/smart-patch-manifest.py usr/share/sonic-smart-patch
+config/50sonic-smart-patch-hooks etc/apt/apt.conf.d
+scripts/install-yang.py usr/share/sonic-smart-patch
+../sonic-yang-models/yang-models/sonic-smart-patch.yang usr/share/sonic-smart-patch/yang

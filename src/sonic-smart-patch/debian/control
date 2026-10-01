@@ -10,7 +10,7 @@ Homepage: https://github.com/sonic-net/SONiC
 
 Package: sonic-smart-patch
 Architecture: all
-Depends: python3 (>= 3.9), ${python3:Depends}, ${misc:Depends}, python3-requests, python3-yaml, python3-click
+Depends: python3 (>= 3.9), ${python3:Depends}, ${misc:Depends}, python3-requests, python3-yaml, python3-click, ca-certificates, debian-archive-keyring
 Description: Resource-bounded SONiC security inventory and evidence agent
  Collects host/container package metadata and bounded read-only runtime facts.
  Synchronizes scoped inventories to central vulnerability assessment workers.

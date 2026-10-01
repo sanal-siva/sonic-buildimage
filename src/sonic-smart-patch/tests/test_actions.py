@@ -11,11 +11,15 @@ class Engine:
     def __init__(self):
         self.calls = []
         self.plan = {"id":"local", "status":"planned", "scope":"host", "package":"curl", "from_version":"1", "target_version":"2", "inventory_digest":"inventory-one"}
-    def create_plan(self, finding, target):
+    def create_plan(self, finding, target, **context):
         self.calls.append("create")
+        self.plan.update({key: value for key, value in context.items() if value is not None})
         return self.plan
     def _load(self, plan_id):
         return self.plan
+    def _save(self, plan):
+        self.plan = plan
+        return plan
     def stage(self, plan_id):
         self.calls.append("stage")
         self.plan["status"]="staged"
@@ -51,6 +55,9 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(first,second)
         self.assertEqual(self.engine.calls,["create","stage","apply"])
         self.assertEqual(first["status"],"complete")
+        self.assertEqual(self.engine.plan["origin"], "service")
+        self.assertEqual(self.engine.plan["service_plan_id"], "remote-one")
+        self.assertEqual(self.engine.plan["request_id"], "action-one")
     def test_advisory_denied(self):
         self.config.set_operating_mode("advisory")
         self.assertEqual(self.executor.execute(self.request)["status"],"denied")

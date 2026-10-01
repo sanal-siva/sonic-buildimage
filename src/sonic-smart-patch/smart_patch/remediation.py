@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -19,11 +20,11 @@ from smart_patch.config import ConfigManager
 from smart_patch.storage import StateStore, atomic_json, now
 from smart_patch.validation import ValidationEngine
 from smart_patch.decision import current_finding, decision_validity
-from smart_patch.maintenance_resources import MaintenanceCommandRunner
+from smart_patch.maintenance_resources import MaintenanceCommandRunner, CONTAINER_FORMAT, container_identity, _same_container
 
 PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?$")
 VERSION = re.compile(r"^[0-9A-Za-z.+:~_-]+$")
-HIGH_IMPACT = re.compile(r"^(linux-|frr|libssl|openssl|libc6|systemd|docker|sonic-|swss|syncd)")
+HIGH_IMPACT = re.compile(r"^(linux-|frr|libssl|openssl|libc6|systemd|docker|containerd|sonic-|swss|syncd)")
 
 OPTIONAL_CHECKS = ["minimum_free_space", "installed_version", "inventory_freshness", "scope_coverage", "decision_expiry",
                    "dependency_policy", "artifact_hashes", "rollback_package_availability",
@@ -71,6 +72,13 @@ class RemediationEngine:
         value = getattr(self, "_phase_checks", None)
         return maintenance_checks_enabled(self.config) if value is None else value
 
+    @staticmethod
+    def _skipped_checks(plan, enabled):
+        if enabled:
+            return []
+        mandatory = {"installed_version", "artifact_hashes", "post_install_version"} if plan["scope"] != "host" else set()
+        return [check for check in OPTIONAL_CHECKS if check not in mandatory]
+
     def _check_free_space(self):
         try:
             minimum = int(self.config.values().get("maintenance_min_free_mib", "500"))
@@ -81,10 +89,34 @@ class RemediationEngine:
         if shutil.disk_usage(self.directory).free < minimum * 1024**2:
             raise ValueError("At least %d MiB of staging free space is required" % minimum)
 
-    @staticmethod
-    def _require_host(plan):
-        if plan.get("scope") != "host":
-            raise ValueError("Container packages require reviewed image maintenance; automatic staging and installation support host packages only")
+    def _inspect_container(self, reference, require_running=True):
+        return container_identity(json.loads(self.runner(
+            ["docker", "inspect", "--format", CONTAINER_FORMAT, reference], timeout=15, limit=16384)), require_running=require_running)
+
+    def _require_scope(self, plan, require_running=True):
+        self._prefix(plan["scope"])
+        if plan["scope"] == "host":
+            return
+        if self.config.values().get("maintenance_mode", "false") != "true":
+            raise ValueError("Container maintenance requires maintenance mode: config security smart-patch maintenance-mode enable")
+        expected = plan.get("container_identity")
+        if not expected:
+            raise ValueError("Container identity was not captured in this plan; create a new plan")
+        expected = container_identity(expected)
+        name = plan["scope"].split(":", 1)[1]
+        if expected["name"].lstrip("/") != name:
+            raise ValueError("Container identity does not match the plan scope")
+        observed = self._inspect_container(name, require_running=require_running)
+        if not _same_container(observed, expected):
+            raise ValueError("Container was recreated or its image identity changed; create a new plan")
+        if not callable(getattr(self.runner, "container", None)):
+            raise ValueError("Container maintenance needs a resource-bounded namespace runner")
+
+    def _run(self, plan, argv, **options):
+        if plan["scope"] == "host":
+            return self.runner(argv, **options)
+        self._require_scope(plan)
+        return self.runner.container(plan["container_identity"], argv, **options)
 
     def _path(self, plan_id):
         if not re.fullmatch(r"[0-9a-f-]{36}", plan_id):
@@ -92,7 +124,20 @@ class RemediationEngine:
         return self.directory / plan_id / "plan.json"
 
     def _save(self, plan):
+        previous = {}
+        try:
+            previous = self._load(plan["id"])
+        except FileNotFoundError:
+            pass
+        plan["revision"] = int(previous.get("revision", 0)) + 1
+        plan["updated_at"] = now()
+        history = previous.get("history", [])[-63:]
+        if not history or history[-1].get("status") != plan["status"]:
+            history.append({"status": plan["status"], "at": plan["updated_at"]})
+        plan["history"] = history
         atomic_json(self._path(plan["id"]), plan)
+        from smart_patch.remediation_status import publish_plan
+        publish_plan(plan, self.store.directory, config=self.config)
         return plan
 
     def _load(self, plan_id):
@@ -103,9 +148,10 @@ class RemediationEngine:
             return []
         if not re.fullmatch(r"container:[A-Za-z0-9][A-Za-z0-9_.-]*", scope):
             raise ValueError("Invalid remediation scope")
-        return ["docker", "exec", scope.split(":", 1)[1]]
+        return ["docker", "exec", "--user", "0", scope.split(":", 1)[1]]
 
-    def create_plan(self, finding_id, target_version):
+    def create_plan(self, finding_id, target_version, *, origin="cli", service_plan_id=None,
+                    request_id=None, finding_ids=None, cve_ids=None, expected_container=None):
         state = self.store.load()
         candidates = [item for item in state.get("findings", []) if item.get("id") == finding_id]
         if not candidates and finding_id in state.get("plan_findings", {}):
@@ -129,14 +175,29 @@ class RemediationEngine:
                 self.runner(["dpkg", "--compare-versions", target_version, "gt", finding["affected_version"]], timeout=5)
             except Exception as error:
                 raise ValueError("A maintenance update must select a newer Debian fixed version") from error
-        plan = {"schema_version": 1, "id": str(uuid.uuid4()), "finding_id": finding_id,
+        component = state.get("inventory", {}).get(finding.get("component_id"), {})
+        plan = {"schema_version": 2, "id": str(uuid.uuid4()), "finding_id": finding_id,
+                "finding_ids": list(dict.fromkeys(finding_ids or [finding_id]))[:100],
+                "cve_ids": list(dict.fromkeys(cve_ids or ([finding["cve_id"]] if finding.get("cve_id") else [])))[:100],
+                "component_id": finding.get("component_id"), "architecture": component.get("architecture", finding.get("architecture")),
+                "inventory_epoch": state.get("epoch"), "build_id": state.get("build_id"),
+                "device_id": state.get("device_id"), "origin": origin,
+                "service_plan_id": service_plan_id, "request_id": request_id,
                 "scope": scope, "package": name, "from_version": finding["affected_version"], "target_version": target_version,
                 "inventory_digest": state.get("inventory_digest"), "created_at": now(), "status": "planned",
-                "impact": "image_maintenance" if HIGH_IMPACT.match(name) or scope != "host" else "package_update",
+                "impact": "image_maintenance" if HIGH_IMPACT.match(name) else "container_package_update" if scope != "host" else "package_update",
                 "evidence": finding.get("evidence", []), "approval": None,
                 "decision_valid_until":finding.get("decision_valid_until"),
                 "required_checks": ["authorized exact target", "APT transaction resolution", "central reassessment"],
                 "optional_checks": list(OPTIONAL_CHECKS), "maintenance_checks_enabled": checks}
+        if scope != "host":
+            plan["container_identity"] = self._inspect_container(scope.split(":", 1)[1])
+            if expected_container and not _same_container(plan["container_identity"], expected_container):
+                raise ValueError("Approved container identity differs from the current container")
+            plan["writable_layer_warning"] = "This update changes the container writable layer. Recreating the container from its original image removes the fix; rebuild the image for a durable fix."
+            plan["required_checks"] += ["maintenance mode", "immutable container identity", "bounded package process",
+                                        "unchanged container dependency transaction", "staged artifact integrity",
+                                        "container restart", "installed target version"]
         for key in ("decision_basis", "remediation_eligible"):
             if key in finding:
                 plan[key] = finding[key]
@@ -150,24 +211,25 @@ class RemediationEngine:
             findings = [state["plan_findings"][finding_id]]
         if not remediation_eligible(plan) or any(not remediation_eligible(item) for item in findings):
             raise ValueError("Inventory-only advisory matches require scoped operator review before remediation")
-        if not self._checks_enabled():
+        checks = self._checks_enabled()
+        if not checks and plan["scope"] == "host":
             return
-        observed = self.runner(self._prefix(plan["scope"]) + ["dpkg-query", "-W", "-f=${Version}", plan["package"]]).strip()
+        observed = self._run(plan, ["dpkg-query", "-W", "-f=${Version}", plan["package"]]).strip()
         if observed != plan["from_version"]:
             raise ValueError("Installed package version differs from approved plan")
-        if state.get("inventory_digest") != plan["inventory_digest"]:
+        if checks and state.get("inventory_digest") != plan["inventory_digest"]:
             raise ValueError("Inventory changed after planning")
-        if decision_validity(plan, state.get("clock_alignment", {})) not in ("not_time_limited", "current"):
+        if checks and decision_validity(plan, state.get("clock_alignment", {})) not in ("not_time_limited", "current"):
             raise ValueError("Supporting assessment expired or its validity cannot be verified")
 
     def _transaction(self, plan):
-        prefix = self._prefix(plan["scope"])
         target = plan["package"] + "=" + plan["target_version"]
         checks = self._checks_enabled()
-        output = self.runner(prefix + ["apt-get", "-s"] + (["--no-remove"] if checks else []) + ["install", target], timeout=60, limit=1048576)
+        container = plan["scope"] != "host"
+        output = self._run(plan, ["apt-get", "-s"] + (["--no-remove"] if checks or container else []) + ["install", target], timeout=60, limit=1048576)
         changes = []
         removed = [line for line in output.splitlines() if line.startswith("Remv ")]
-        if checks and removed:
+        if (checks or container) and removed:
             raise ValueError("Plan would remove packages")
         plan["transaction_removed"] = removed
         for line in output.splitlines():
@@ -183,11 +245,40 @@ class RemediationEngine:
                 changes.append({"package": name, "from_version": old, "to_version": new})
         if not changes:
             raise ValueError("APT simulation found no changes")
-        if checks and any(HIGH_IMPACT.match(item["package"]) for item in changes):
+        if (checks or container) and any(HIGH_IMPACT.match(item["package"]) for item in changes):
             raise ValueError("Core/routing/kernel dependency requires reviewed SONiC image maintenance")
         return changes
 
     def _download(self, plan, change, direction):
+        try:
+            return self._download_apt(plan, change, direction)
+        except Exception as original:
+            if direction != "rollback" or self.config.values().get("rollback_snapshot_enabled", "true") != "true":
+                raise
+            try:
+                from smart_patch.rollback_snapshot import download_rollback
+                release = self._run(plan, ["cat", "/etc/os-release"], timeout=15, limit=16384)
+                distro = {}
+                for line in release.splitlines():
+                    if "=" in line and not line.startswith("#"):
+                        key, value = line.split("=", 1)
+                        if key in ("ID", "VERSION_CODENAME", "VERSION_ID"):
+                            parsed = shlex.split(value)
+                            distro[key] = parsed[0] if len(parsed) == 1 else ""
+                architecture = change["package"].split(":", 1)[1] if ":" in change["package"] else self._run(
+                    plan, ["dpkg-query", "-W", "-f=${Architecture}", change["package"]], timeout=15, limit=1024).strip()
+                if architecture == "all":
+                    architecture = self._run(plan, ["dpkg", "--print-architecture"], timeout=15, limit=1024).strip()
+                # Scope metadata is measured in the container when appropriate;
+                # APT archive verification/download runs in an isolated host dir.
+                return download_rollback(change["package"], change["from_version"],
+                    self._path(plan["id"]).parent / direction, runner=self.runner,
+                    distro=distro, architecture=architecture, config=self.config)
+            except Exception as fallback:
+                raise ValueError("%s; Debian snapshot fallback unavailable: %s" % (
+                    str(original)[:500], str(fallback)[:500])) from fallback
+
+    def _download_apt(self, plan, change, direction):
         directory = self._path(plan["id"]).parent / direction
         directory.mkdir(exist_ok=True)
         version = change["to_version"] if direction == "forward" else change["from_version"]
@@ -199,11 +290,11 @@ class RemediationEngine:
             except Exception as error:
                 raise ValueError("Exact %s version download unavailable: %s; %s" % (direction, target, str(error)[:300])) from error
         else:
-            name = plan["scope"].split(":", 1)[1]
             container_directory = "/var/tmp/sonic-smart-patch-" + plan["id"] + "/" + direction
-            self.runner(["docker", "exec", name, "mkdir", "-p", container_directory])
-            self.runner(["docker", "exec", "--workdir", container_directory, name, "apt-get", "download", target], timeout=180, limit=1048576)
-            self.runner(["docker", "cp", name + ":" + container_directory + "/.", str(directory)], timeout=180)
+            self._run(plan, ["mkdir", "-p", container_directory])
+            self._run(plan, ["apt-get", "download", target], cwd=container_directory, timeout=180, limit=1048576)
+            self._require_scope(plan)
+            self.runner(["docker", "cp", plan["container_identity"]["id"] + ":" + container_directory + "/.", str(directory)], timeout=180)
         matches = []
         for artifact in directory.glob("*.deb"):
             fields = self.runner(["dpkg-deb", "-f", str(artifact), "Package", "Version"]).splitlines()
@@ -225,28 +316,44 @@ class RemediationEngine:
 
     def stage(self, plan_id):
         with self._maintenance_lock():
-            return self._stage(plan_id)
+            try:
+                return self._stage(plan_id)
+            except Exception as error:
+                plan = self._load(plan_id)
+                if plan["status"] in ("staging", "downloading", "downloaded"):
+                    plan.update(status="failed", error=str(error)[:1000], failed_at=now())
+                    self._save(plan)
+                raise
 
     def _stage(self, plan_id):
         if self.config.get_operating_mode() == "advisory":
             raise ValueError("Advisory mode permits planning only; choose assisted to stage")
         plan = self._load(plan_id)
-        self._require_host(plan)
+        self._require_scope(plan)
         if plan["status"] != "planned":
             raise ValueError("Only planned maintenance can be staged")
         if plan["impact"] == "image_maintenance":
             raise ValueError("This plan requires a reviewed SONiC image maintenance procedure")
         checks = self._checks_enabled()
         plan.update(maintenance_checks_enabled=checks, staging_checks_enabled=checks,
-                    checks_skipped=[] if checks else list(OPTIONAL_CHECKS))
+                    checks_skipped=self._skipped_checks(plan, checks))
         if checks:
             self._check_free_space()
         self._verify_current(plan)
+        plan["status"] = "staging"
+        self._save(plan)
         changes = self._transaction(plan)
         plan["transaction"] = changes
         # Forward packages are necessary to execute the requested operation.
         # Rollback availability is optional only when the local checks are off.
-        plan["artifacts"] = {"forward": [self._download(plan, item, "forward") for item in changes], "rollback": []}
+        plan.update(status="downloading", artifacts={"forward": [], "rollback": []})
+        self._save(plan)
+        for item in changes:
+            plan["artifacts"]["forward"].append(self._download(plan, item, "forward"))
+            self._save(plan)
+        plan["status"] = "downloaded"
+        plan["downloaded_at"] = now()
+        self._save(plan)
         plan["rollback_missing"] = []
         for item in changes:
             try:
@@ -271,7 +378,9 @@ class RemediationEngine:
         if not artifacts:
             raise ValueError("No staged %s package artifacts are available" % direction)
         checks = self._checks_enabled()
-        if checks:
+        container = plan["scope"] != "host"
+        self._require_scope(plan)
+        if checks or container:
             for artifact in artifacts:
                 hasher = hashlib.sha256()
                 with open(artifact["path"], "rb") as stream:
@@ -280,18 +389,17 @@ class RemediationEngine:
                 if hasher.hexdigest() != artifact["sha256"]:
                     raise ValueError("Staged artifact digest changed")
         paths = [item["path"] for item in artifacts]
-        prefix = self._prefix(plan["scope"])
-        if prefix:
-            name = plan["scope"].split(":", 1)[1]
+        if container:
             container_directory = "/var/tmp/sonic-smart-patch-" + plan["id"] + "/" + direction
-            self.runner(prefix + ["mkdir", "-p", container_directory])
+            self._run(plan, ["mkdir", "-p", container_directory])
             paths = []
             for artifact in artifacts:
                 target = container_directory + "/" + Path(artifact["path"]).name
-                self.runner(["docker", "cp", artifact["path"], name + ":" + target], timeout=120)
+                self._require_scope(plan)
+                self.runner(["docker", "cp", artifact["path"], plan["container_identity"]["id"] + ":" + target], timeout=120)
                 paths.append(target)
-        cache_options = []
-        if not prefix:
+            cache_options = ["-o", "Dir::Cache::Archives=" + container_directory]
+        else:
             # APT can prefer a configured repository record for a version even
             # when the same .deb is explicitly supplied. With --no-download,
             # that record must resolve in its archive cache. apt-get download
@@ -301,13 +409,44 @@ class RemediationEngine:
             if any(Path(path).resolve().parent != cache_directory for path in paths):
                 raise ValueError("Staged artifacts must remain in this plan's %s directory" % direction)
             cache_options = ["-o", "Dir::Cache::Archives=" + str(cache_directory)]
-        self.runner(prefix + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-y", "--no-download"]
-                    + cache_options + (["--no-remove"] if checks else []) + ["--allow-downgrades", "install"] + paths, timeout=600, limit=2*1024*1024)
-        if checks:
+        self._run(plan, ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-y", "--no-download"]
+                  + cache_options + (["--no-remove"] if checks or container else []) + ["--allow-downgrades", "install"] + paths, timeout=600, limit=2*1024*1024)
+        if checks and not container:
             for artifact in artifacts:
-                observed = self.runner(prefix + ["dpkg-query", "-W", "-f=${Version}", artifact["package"]]).strip()
+                observed = self._run(plan, ["dpkg-query", "-W", "-f=${Version}", artifact["package"]]).strip()
                 if observed != artifact["version"]:
                     raise ValueError("Installed version failed verification for " + artifact["package"])
+
+    def _restart_container(self, plan, direction):
+        if plan["scope"] == "host":
+            return
+        self._require_scope(plan, require_running=False)
+        expected = plan["container_identity"]
+        plan.update(status="restarting", container_restart={"status": "running", "container_id": expected["id"],
+                    "direction": direction, "started_at": now()})
+        self._save(plan)
+        restart_returned = False
+        try:
+            self.runner(["docker", "restart", "--time", "10", expected["id"]], timeout=90, limit=16384)
+            restart_returned = True
+            # Check stable liveness, then query the exact post-restart package
+            # version within the same immutable container identity.
+            for attempt in range(3):
+                self._require_scope(plan)
+                if attempt < 2:
+                    time.sleep(1)
+            version = plan["target_version"] if direction == "forward" else plan["from_version"]
+            for artifact in plan["artifacts"][direction]:
+                observed = self._run(plan, ["dpkg-query", "-W", "-f=${Version}", artifact["package"]]).strip()
+                if observed != artifact["version"]:
+                    raise ValueError("Package version after container restart differs from the requested version for " + artifact["package"])
+            plan["container_restart"].update(status="complete", completed_at=now(), observed_version=version)
+        except Exception as error:
+            plan["container_restart"].update(status="failed" if restart_returned else "unknown", completed_at=now(),
+                                            outcome_unknown=not restart_returned, error=str(error)[:1000])
+            self._save(plan)
+            raise
+        self._save(plan)
 
     @staticmethod
     def _rollback_available(plan):
@@ -322,7 +461,7 @@ class RemediationEngine:
     def apply(self, plan_id, approved=False):
         with self._maintenance_lock():
             plan = self._load(plan_id)
-            self._require_host(plan)
+            self._require_scope(plan)
             mode = self.config.get_operating_mode()
             if mode == "advisory":
                 raise ValueError("Advisory mode cannot apply maintenance")
@@ -333,7 +472,7 @@ class RemediationEngine:
             if plan["status"] != "staged":
                 raise ValueError("A staged exact-version plan is required")
             checks = self._checks_enabled()
-            plan.update(maintenance_checks_enabled=checks, checks_skipped=[] if checks else list(OPTIONAL_CHECKS))
+            plan.update(maintenance_checks_enabled=checks, checks_skipped=self._skipped_checks(plan, checks))
             if checks:
                 self._check_free_space()
             state = self.store.load()
@@ -341,22 +480,26 @@ class RemediationEngine:
                 raise ValueError("Inventory changed after planning; create a new plan")
             self._verify_current(plan)
             plan["rollback_available"] = self._rollback_available(plan)
+            if checks or plan["scope"] != "host":
+                if digest(self._transaction(plan)) != plan["transaction_digest"]:
+                    raise ValueError("Dependency transaction changed after staging")
             if checks:
                 if plan.get("staging_checks_enabled") is False:
                     raise ValueError("This plan was staged with maintenance checks disabled; create a fresh plan and stage it with checks enabled")
                 if not plan["rollback_available"]:
                     raise ValueError("Complete rollback artifacts are required when maintenance checks are enabled; restage this plan")
-                if digest(self._transaction(plan)) != plan["transaction_digest"]:
-                    raise ValueError("Dependency transaction changed after staging")
                 plan["pre_validation"] = self.validation.snapshot()
                 if plan["pre_validation"]["errors"]:
                     raise ValueError("Cannot establish complete SONiC health baseline")
             else:
                 plan["pre_validation"] = {"status": "SKIPPED", "errors": [], "reason": "maintenance_checks_enabled=false"}
-            plan.update(status="applying", approval="operator" if approved else "autonomous_policy", started_at=now())
+            plan.update(status="installing", approval="operator" if approved else "autonomous_policy", started_at=now())
             self._save(plan)
             try:
                 self._install(plan, "forward")
+                plan.update(status="installed", installed_at=now())
+                self._save(plan)
+                self._restart_container(plan, "forward")
                 if checks:
                     plan["post_validation"] = self.validation.compare(plan["pre_validation"], self.validation.snapshot())
                     if plan["post_validation"]["status"] != "PASS":
@@ -369,6 +512,12 @@ class RemediationEngine:
                 (self.store.directory / "dirty").touch()
                 return plan
             except Exception as error:
+                if plan.get("container_restart", {}).get("outcome_unknown"):
+                    # A killed Docker client cannot cancel a daemon-side restart.
+                    # Do not race it by launching an automatic rollback/restart.
+                    plan.update(status="unknown", error=str(error),
+                                rollback_error="Container restart outcome is unknown; inspect this exact container before recovery")
+                    return self._save(plan)
                 if not plan["rollback_available"]:
                     plan.update(status="failed", error=str(error), rollback_error="Automatic rollback unavailable: complete previous-version artifacts were not staged")
                     plan["failed_at"] = now()
@@ -386,12 +535,16 @@ class RemediationEngine:
 
     def _rollback(self, plan_id):
         plan = self._load(plan_id)
-        if plan["status"] not in ("applying", "rollback_required", "pending_reassessment", "rollback_failed"):
+        if plan["status"] not in ("applying", "installing", "installed", "restarting", "rollback_required", "pending_reassessment", "rollback_failed"):
             raise ValueError("Plan is not eligible for rollback")
-        if not self._rollback_available(plan):
-            raise ValueError("Automatic rollback unavailable: complete previous-version artifacts were not staged")
         try:
+            if not self._rollback_available(plan):
+                raise ValueError("Automatic rollback unavailable: complete previous-version artifacts were not staged")
+            self._require_scope(plan)
+            plan["status"] = "rolling_back"
+            self._save(plan)
             self._install(plan, "rollback")
+            self._restart_container(plan, "rollback")
             if self._checks_enabled() and plan.get("pre_validation", {}).get("status") != "SKIPPED":
                 plan["rollback_validation"] = self.validation.compare(plan["pre_validation"], self.validation.snapshot())
                 plan["status"] = "rolled_back" if plan["rollback_validation"]["status"] == "PASS" else "rollback_failed"

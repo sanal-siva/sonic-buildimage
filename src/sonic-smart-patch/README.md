@@ -21,22 +21,23 @@ make deb
 dpkg-buildpackage -us -uc -b
 ```
 
-`make deb` produces `../sonic-smart-patch_3.0.0-1_all.deb` using `dpkg-deb` and the
+`make deb` produces `../sonic-smart-patch_3.1.0-1_all.deb` using `dpkg-deb` and the
 same runtime sources and assets. The standard SONiC build uses `debian/rules`.
 The architecture-independent package requires Python 3.9+, requests, PyYAML and
 Click. SONiC provides ConfigDB/STATE_DB connectors and the native command loader.
 
 ## Configure a switch
 
-Version 3 uses a new package, module, configuration table and storage paths.
-Install it as a fresh deployment after removing any earlier collector package;
-it does not import earlier enrollment, credentials or maintenance state. Configure
-the service URL and provision a new device token before enabling reporting.
+Version 3 uses the Smart Patch package, module, configuration table and storage paths.
+A new deployment needs its service URL and device token before reporting. Upgrading
+an existing Smart Patch 3.0 installation to 3.1 preserves enrollment, credentials
+and action journals; do not reset or remove that state. Older product naming has
+no compatibility aliases or automatic state import.
 The default remains disabled/advisory, with maintenance checks disabled.
 
 ```sh
-sudo dpkg -i sonic-smart-patch_3.0.0-1_all.deb
-sudo config security service-url https://MANAGEMENT_SERVER:8443
+sudo dpkg -i sonic-smart-patch_3.1.0-1_all.deb
+sudo config security service-url "https://<server-ip>:8000"
 sudo config security auth-token --token-file /secure/path/device-token
 sudo config security setting ca_bundle /etc/sonic/smart-patch/service-ca.pem
 sudo config security smart-patch --mode advisory
@@ -229,10 +230,10 @@ package cannot be downloaded. It records `rollback_available=false` and the miss
 packages. No partial automatic rollback is attempted when the recovery set is
 incomplete: a failed install is reported for manual recovery. Skipped checks are
 recorded as skipped, never as passed. APT's configured repository trust and actual
-package-manager errors still apply. Native automatic stage/apply/rollback is limited to eligible
-host packages. Container changes require manual container/image maintenance;
-bounding a Docker client would not establish a limit on the package process
-running inside its container.
+package-manager errors still apply. Native automatic stage/apply/rollback supports eligible host packages and permitted
+ordinary packages in compatible running SONiC containers. The Docker exec/gate or
+namespace fallback bounds the actual package command; wrapping only a Docker client
+would not establish that limit. Protected core/image changes remain manual.
 `rollback_available=true` means the complete staged recovery artifact set was
 retained. It does not guarantee restoration, particularly when dependency checks
 were disabled and the package manager can change the dependency transaction.
@@ -257,7 +258,7 @@ only when all required rollback artifacts were retained, and record its actual
 outcome. Successful package installation remains `pending_reassessment`
 until central vulnerability assessment confirms the outcome.
 
-Authentication, supported host-package boundaries, exact authorized target,
+Authentication, supported scope/container identity boundaries, exact authorized target,
 operating mode, explicit approval/expiry and idempotence remain mandatory.
 Core SONiC, routing, OpenSSL/libc and kernel targets require reviewed SONiC image
 maintenance. With checks enabled, dependency policy also rejects new-dependency,
@@ -265,6 +266,96 @@ package-removal and protected dependency transactions. This implementation does
 not pretend that generic apt/GRUB operations provide safe image rollback.
 It generates a maintenance requirement and denies automated execution of those
 unsupported transactions.
+
+## Container maintenance mode and CVE history
+
+```bash
+sudo config security smart-patch mode assisted
+sudo config security smart-patch maintenance-mode enable
+show security remediation
+show security cves --scope container:pmon --json
+show security remediation --cve CVE-2023-41910 --status pending_reassessment
+show security remediation --status resolved --json
+# After the authorized maintenance operation is finished:
+sudo config security smart-patch maintenance-mode disable
+```
+
+Standalone equivalents use `sudo security config ...` and `security show ...`.
+`maintenance_mode` defaults to false and is mandatory for container stage/apply,
+restart and rollback regardless of the optional check toggle. It grants permission
+for reviewed container work; it does not drain traffic, withdraw routes or approve
+a package plan. Plan approval remains a separate local `apply --approve` or central
+stage/execute workflow.
+
+Supported targets are ordinary Debian packages in compatible running SONiC
+containers. The worker selects two paths without recreating the container or
+changing its security profile:
+
+- **Unified cgroup v2:** Docker Engine creates an exec with `Privileged=false`,
+  retaining the original container namespaces, seccomp/LSM profile and capabilities.
+  Python 3 inside the container runs a small gate before any package command. A
+  private Unix-socket handshake verifies `SO_PEERCRED`, the exact Docker Exec PID,
+  command and namespaces. The host passes only the current maintenance unit's
+  `cgroup.procs` descriptor; the gate writes PID `0` to attach itself. The host
+  verifies membership, then sends `GO`. No recyclable numeric PID is migrated by
+  a host write. This path needs target `/usr/bin/python3`, Docker Engine API 1.41+
+  and host pidfd/cgroup v2 support. Existing seccomp filtering remains in effect.
+- **Older cgroup v1:** the worker pins the captured container's namespace/root
+  descriptors and runs within the host maintenance cgroup. It supports compatible
+  unconfined, non-remapped containers, including the supported privileged SONiC
+  service-container case. Confined targets fail closed because namespace entry
+  alone cannot reproduce their filters.
+
+Both paths require trusted native systemd/Docker tools and established worker
+memory/task/CPU/deadline limits. The exact container ID, image ID and name remain
+bound to the plan. Unsupported setup, user remapping, stopped/replaced containers,
+failed resource attachment or identity uncertainty stops execution. The cgroup v2
+path creates a temporary private helper directory/socket inside the container and
+removes it during cleanup. The actual package process runs within the bounded
+maintenance unit, not merely its Docker client. After install, Smart Patch
+restarts only that captured container and observes its running identity and package
+version. Protected core/kernel/FRR/OpenSSL/libc updates remain manual in every scope.
+
+Container writes are in the writable layer and can be lost on recreation or image
+replacement. Build and qualify an updated SONiC/service image for a durable fix.
+The collector reports later inventory changes, including a returning CVE.
+
+The new progress reporter sends changed local plan revisions separately from normal
+sync so long APT commands do not hide all progress. CLI-origin plans are visible as
+read-only history in the service **Remediation status** page. Public CLI output merges
+newer local phases with bounded central results and reports connection/truncation.
+`installed` and `pending_reassessment` are collector outcomes; `resolved` requires
+changed exact-target inventory and a complete current central scan after the local
+installation report. `no_longer_reported` is distinct from verified closure. Later
+rollback/failure and recurring findings retain their history without falsely keeping
+a current resolved result.
+
+## Exact previous Debian packages from snapshots
+
+```bash
+# Enabled by default; applies only when ordinary exact-version retrieval fails.
+sudo config security setting rollback_snapshot_enabled true
+# Optional reviewed date, format YYYYMMDDThhmmssZ:
+# sudo config security setting rollback_snapshot_timestamp '<snapshot-timestamp>'
+# Clear a date override:
+# sudo config security setting rollback_snapshot_timestamp ''
+```
+
+The fallback queries [Debian's official snapshot archive](https://snapshot.debian.org/)
+for the exact binary package/version/architecture and target scope's Debian release.
+Containers can have a different distribution from the host. It uses private APT
+configuration, sources, lists, status and cache; inherited host update hooks, normal
+source files and credentials remain untouched. Repository signatures are verified
+using the Debian archive keyring. Historical validity-date expiry is ignored only
+within this isolated operation; package identity and archive/hash verification remain
+required. Archive, suite, timestamp and retained SHA-256 are attached to rollback
+evidence. Missing vendor/custom packages remain unavailable; the newest Debian
+package is never substituted for the previous version. Incomplete recovery sets
+continue to be reported according to `maintenance_checks_enabled`.
+
+The matching intelligence service also exposes 50 MiB SBOM document uploads. Upload
+limits and central analysis run on the server and do not increase the switch's
+collector memory budget.
 
 ## Build identity
 
@@ -284,7 +375,7 @@ health evidence failure, and approved/idempotent maintenance actions. Run the
 optional service-contract check with the service's Python environment:
 
 ```sh
-python3 scripts/check-service-contract.py /path/to/sonic-smart-patch-intel-svc-hackathon-2026
+python3 scripts/check-service-contract.py "<path-to-intelligence-service>"
 ```
 
 Live-switch installation, central scanner database behavior and real routing

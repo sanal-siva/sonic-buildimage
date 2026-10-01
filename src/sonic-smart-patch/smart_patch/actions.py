@@ -49,6 +49,13 @@ class ActionExecutor:
             remote_id = str(remote.get("id", ""))
             if not remote_id or len(remote_id) > 128:
                 raise ValueError("Invalid remote plan identifier")
+            if str(remote.get("scope", "")).startswith("container:"):
+                expected_container = remote.get("container_identity")
+                if (not isinstance(expected_container, dict)
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(expected_container.get("id", "")))
+                        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(expected_container.get("image", "")))
+                        or not expected_container.get("name")):
+                    raise ValueError("Approved container plan must identify the immutable container ID and image")
             local_id = state.get("remote_plans", {}).get(remote_id)
             if local_id:
                 plan = self.engine._load(local_id)
@@ -78,7 +85,10 @@ class ActionExecutor:
                         # An authenticated scoped review may be newer than the
                         # bounded finding cache delivered on an earlier poll.
                         state["findings"] = [finding if item.get("id") == finding_id else item for item in state.get("findings", [])]
-                plan = self.engine.create_plan(remote.get("finding_id"), remote.get("target_version"))
+                plan = self.engine.create_plan(remote.get("finding_id"), remote.get("target_version"),
+                    origin="service", service_plan_id=remote_id, request_id=request_id,
+                    finding_ids=remote.get("finding_ids"), cve_ids=remote.get("cve_ids"),
+                    expected_container=remote.get("container_identity"))
                 local_id = plan["id"]
             for local_key, remote_key in (("scope", "scope"), ("package", "package_name"), ("from_version", "from_version"), ("target_version", "target_version"), ("inventory_digest", "inventory_digest")):
                 if local_key == "inventory_digest" and (action == "rollback_plan" or not checks):
@@ -98,6 +108,17 @@ class ActionExecutor:
                 self.engine._save(plan)
             elif checks and plan.get("target_package_sha256"):
                 raise ValueError("Verified target digest missing from previously verified plan")
+            if plan.get("origin") == "service" and plan.get("service_plan_id") != remote_id:
+                raise ValueError("Local plan belongs to another service plan")
+            if remote.get("container_identity"):
+                from smart_patch.maintenance_resources import _same_container
+                if not _same_container(plan.get("container_identity", {}), remote["container_identity"]):
+                    raise ValueError("Approved container identity differs from the current container")
+            plan.update(origin="service", service_plan_id=remote_id, request_id=request_id)
+            if plan.get("status") == "planned":
+                plan["finding_ids"] = list(dict.fromkeys(remote.get("finding_ids") or [remote.get("finding_id")]))[:100]
+                plan["cve_ids"] = list(dict.fromkeys(remote.get("cve_ids") or plan.get("cve_ids", [])))[:100]
+            self.engine._save(plan)
             with self.store.transaction() as state:
                 state.setdefault("remote_plans", {})[remote_id] = local_id
                 state.setdefault("action_journal", {})[request_id] = {"status":"executing", "local_plan_id": local_id, "started_at":now(), "expires_at":remote["expires_at"]}
@@ -115,7 +136,9 @@ class ActionExecutor:
             fact["status"] = "complete" if successful else "failed"
             fact["value"].update(status=result["status"], local_plan_id=local_id,
                                  details={key:result[key] for key in ("error", "pre_validation", "post_validation", "rollback_validation", "rollback_error",
-                                     "maintenance_checks_enabled", "checks_skipped", "rollback_available", "rollback_missing") if key in result})
+                                     "maintenance_checks_enabled", "checks_skipped", "rollback_available", "rollback_missing",
+                                     "container_identity", "container_restart", "writable_layer_warning", "history",
+                                     "downloaded_at", "installed_at") if key in result})
         except ValueError as error:
             fact["status"] = "denied"
             fact["value"].update(status="denied", details=str(error))

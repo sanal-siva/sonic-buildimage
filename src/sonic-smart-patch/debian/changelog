@@ -1,3 +1,12 @@
+sonic-smart-patch (3.1.0-1) unstable; urgency=medium
+
+  * Add explicit maintenance-mode container updates with bounded namespace
+    workers, exact container identity, automatic restart and version verification.
+  * Publish CLI and service remediation progress and central reassessment outcomes.
+  * Recover exact Debian rollback archives through authenticated snapshot sources.
+
+ -- SONiC Contributors <dev@sonicdev.org>  Thu, 01 Oct 2026 10:08:47 +0000
+
 sonic-smart-patch (3.0.0-1) unstable; urgency=medium
 
   * Rename package, Python module, CLI, configuration, service and build artifacts

@@ -85,7 +85,7 @@ class MaintenanceChecksTests(unittest.TestCase):
         self.assertEqual(staged["rollback_missing"][0]["version"], "1.0")
         self.assertIn("rollback_package_availability", staged["checks_skipped"])
         self.assertTrue(staged["artifacts"]["forward"])
-        self.assertFalse(any(argv[0] == "dpkg-query" for argv in self.runner.calls))
+        self.assertFalse(any(argv[0] == "dpkg-query" and "-f=${Version}" in argv for argv in self.runner.calls))
 
     def test_default_disabled_installs_without_health_or_version_claims(self):
         self.runner.missing.add(("smart-patch-testprobe", "1.0"))
@@ -99,7 +99,7 @@ class MaintenanceChecksTests(unittest.TestCase):
         self.assertFalse(result["rollback_available"])
         self.assertEqual(self.runner.versions["smart-patch-testprobe"], "1.1")
         self.assertTrue((self.store.directory / "dirty").exists())
-        self.assertFalse(any(argv[0] == "dpkg-query" for argv in self.runner.calls))
+        self.assertFalse(any(argv[0] == "dpkg-query" and "-f=${Version}" in argv for argv in self.runner.calls))
 
     def test_new_dependency_and_removal_are_recorded_without_claiming_rollback(self):
         self.runner.simulation += "Inst new-helper (2.0 stable [amd64])\nRemv old-helper [1.0]\n"
@@ -118,6 +118,7 @@ class MaintenanceChecksTests(unittest.TestCase):
                  ("Inst libc6 [2.1] (2.2 stable [amd64])\n", "Core/routing/kernel")]
         for extra, expected in cases:
             with self.subTest(extra=extra):
+                self.plan = self.engine.create_plan("finding-one", "1.1")
                 self.runner.simulation = "Inst smart-patch-testprobe [1.0] (1.1 stable [amd64])\n" + extra
                 with self.assertRaisesRegex(ValueError, expected):
                     self.engine.stage(self.plan["id"])
@@ -130,13 +131,13 @@ class MaintenanceChecksTests(unittest.TestCase):
         self.runner.missing.add(("smart-patch-testprobe", "1.0"))
         with self.assertRaisesRegex(ValueError, "rollback version download unavailable"):
             self.engine.stage(self.plan["id"])
-        self.assertEqual(self.engine._load(self.plan["id"])["status"], "planned")
+        self.assertEqual(self.engine._load(self.plan["id"])["status"], "failed")
 
     def test_missing_forward_package_cannot_be_reported_as_staged_when_checks_are_disabled(self):
         self.runner.missing.add(("smart-patch-testprobe", "1.1"))
         with self.assertRaisesRegex(ValueError, "forward version download unavailable"):
             self.engine.stage(self.plan["id"])
-        self.assertEqual(self.engine._load(self.plan["id"])["status"], "planned")
+        self.assertEqual(self.engine._load(self.plan["id"])["status"], "failed")
 
     def test_strict_installed_inventory_and_assessment_checks_remain(self):
         self.enabled()
@@ -229,7 +230,7 @@ class MaintenanceChecksTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Explicit approval"):
             self.engine.apply(self.plan["id"])
         self.engine._save({**self.engine._load(self.plan["id"]), "scope": "container:pmon"})
-        with self.assertRaisesRegex(ValueError, "host packages only"):
+        with self.assertRaisesRegex(ValueError, "maintenance mode"):
             self.engine.apply(self.plan["id"], approved=True)
         self.assertFalse(any(argv[0] == "env" for argv in self.runner.calls))
 

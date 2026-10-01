@@ -19,6 +19,12 @@ class Agent:
         self.collector = collector or InventoryCollector(max_components=int(self.config.values()["max_components"]))
         self.session = session or requests.Session()
 
+    def _invalidate_report_identity(self):
+        try:
+            (self.store.directory / "remediation-identity.json").unlink()
+        except FileNotFoundError:
+            pass
+
     def _url(self):
         url = self.config.get_service_url()
         if not url:
@@ -61,6 +67,7 @@ class Agent:
         device = identity(self.config.get_sbom_source(), self.config.directory)
         identity_changed = state.get("device_id") not in (None, device["device_id"])
         if identity_changed:
+            self._invalidate_report_identity()
             # An operator may preserve an existing enrollment or rotate it during
             # clone recovery. Never replay another device's queued authorization.
             for field in ("pending", "findings", "assessed_inventory_digest", "assessment_revision",
@@ -71,6 +78,7 @@ class Agent:
         if state.get("pending"):
             return state["pending"]
         if state.get("build_id") != device["build_id"] or state.get("device_id") != device["device_id"]:
+            self._invalidate_report_identity()
             state.update(epoch=str(uuid.uuid4()), sequence=0, acknowledged_fingerprints={}, acknowledged_digest="",
                          build_id=device["build_id"], device_id=device["device_id"])
         dirty = self.store.directory / "dirty"
@@ -141,6 +149,7 @@ class Agent:
                                   verified_transport=url.startswith("https://"))
                 with self.store.transaction() as state:
                     if result.get("resync_required"):
+                        self._invalidate_report_identity()
                         state.update(epoch=str(uuid.uuid4()), sequence=0, acknowledged_fingerprints={})
                         state.pop("pending", None)
                         state["sync_status"] = "resync_required"
@@ -157,6 +166,8 @@ class Agent:
                     state["acknowledged_fingerprints"] = {key:digest(item) for key,item in state["inventory"].items()}
                     state.pop("acknowledged_inventory", None)
                     state["acknowledged_digest"] = envelope["inventory_digest"]
+                    state["acknowledged_epoch"] = envelope["epoch"]
+                    state["acknowledged_build_id"] = envelope["build_id"]
                     state.pop("pending", None)
                     state.pop("action_facts", None)
                     state["last_sync"] = now()
@@ -242,6 +253,20 @@ class Agent:
             state["sync_status"] = "disabled"
         token = self.config.get_auth_token()
         atomic_json(self.store.directory / "public.json", public_snapshot(state, credentials=(token,)), mode=0o644)
+        # The progress thread needs only the acknowledged transport identity,
+        # not another parse/hash/write of the full inventory every few seconds.
+        report_identity = {key: state.get(key) for key in
+                           ("device_id", "epoch", "build_id", "acknowledged_digest", "sync_status")}
+        identity_path = self.store.directory / "remediation-identity.json"
+        try:
+            previous_identity = json.loads(identity_path.read_text())
+        except (OSError, ValueError):
+            previous_identity = None
+        if (not state.get("acknowledged_digest") or state.get("acknowledged_epoch") != state.get("epoch")
+                or state.get("acknowledged_build_id") != state.get("build_id")):
+            self._invalidate_report_identity()
+        elif previous_identity != report_identity:
+            atomic_json(identity_path, report_identity, mode=0o600)
         atomic_json(self.config.directory / "public-config.json",
                     {key:configuration[key] for key in PUBLIC_FIELDS}, mode=0o644)
         values = {"sync_status": state.get("sync_status", "never_connected"), "last_sync": state.get("last_sync", "never"),

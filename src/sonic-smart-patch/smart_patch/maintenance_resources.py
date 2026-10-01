@@ -259,6 +259,20 @@ class MaintenanceCommandRunner:
                    str(self.config.values().get("maintenance_cpu_quota_percent", "0")), cwd, *argv]
         return self.run(command, timeout=timeout, limit=limit, container_worker=True)
 
+    def copy_from_container(self, identity, source, destination, timeout=180):
+        if not self._check(self.available, systemd_available) or not _trusted_executable("/usr/bin/python3"):
+            raise RuntimeError("Container artifact transfer requires a trusted root systemd manager and Python helper")
+        command = ["/usr/bin/python3", "-m", "smart_patch.container_artifacts", "export",
+                   json.dumps(container_identity(identity), separators=(",", ":")), str(source), str(destination)]
+        return json.loads(self.run(command, timeout=timeout, limit=65536, container_worker=True))
+
+    def copy_to_container(self, identity, source, destination, sha256, timeout=120):
+        if not self._check(self.available, systemd_available) or not _trusted_executable("/usr/bin/python3"):
+            raise RuntimeError("Container artifact transfer requires a trusted root systemd manager and Python helper")
+        command = ["/usr/bin/python3", "-m", "smart_patch.container_artifacts", "import",
+                   json.dumps(container_identity(identity), separators=(",", ":")), str(source), str(destination), sha256]
+        return json.loads(self.run(command, timeout=timeout, limit=65536, container_worker=True))
+
     def run(self, argv, timeout=15, limit=4 * 1024 * 1024, cwd=None, container_worker=False):
         if (not isinstance(argv, (list, tuple)) or not argv or not argv[0]
                 or any(not isinstance(arg, str) or "\0" in arg for arg in argv)):

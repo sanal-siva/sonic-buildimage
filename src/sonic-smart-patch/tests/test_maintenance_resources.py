@@ -200,6 +200,27 @@ class MaintenanceResourceTests(unittest.TestCase):
             command.container(identity, ["apt-get", "download", "socat=1.1"])
         self.process.assert_not_called()
 
+    def test_artifact_transfer_uses_a_bounded_strict_device_worker(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/radv", "running": True, "pid": 12}
+        self.process.return_value = '{"files":[]}'
+        with patch("smart_patch.maintenance_resources._trusted_executable", return_value=True):
+            self.assertEqual(self.command.copy_from_container(identity, "/var/tmp/fixture", "/fixture/plans/cache"), {"files": []})
+        argv = self.process.call_args.args[0]
+        self.assertIn("smart_patch.container_artifacts", argv)
+        self.assertIn("export", argv)
+        self.assertIn("--property=MemoryMax=512M", argv)
+        self.assertIn("--property=DevicePolicy=strict", argv)
+        self.assertEqual(self.process.call_args.kwargs["timeout"], 190)
+
+    def test_artifact_copy_cannot_bypass_the_container_worker_precondition(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/radv", "running": True, "pid": 12}
+        runner = MaintenanceCommandRunner(self.config, runner=self.process, available=False, in_collector=False)
+        with self.assertRaisesRegex(RuntimeError, "trusted root systemd"):
+            runner.copy_from_container(identity, "/runtime", "/cache")
+        with self.assertRaisesRegex(RuntimeError, "trusted root systemd"):
+            runner.copy_to_container(identity, "/cache/file.deb", "/runtime/file.deb", "a" * 64)
+        self.process.assert_not_called()
+
     def test_namespace_helper_pins_all_handles_without_joining_container_cgroup(self):
         identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
         seen = SimpleNamespace(stdout=json.dumps(identity))

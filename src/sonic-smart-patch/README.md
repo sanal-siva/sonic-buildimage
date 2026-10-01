@@ -21,7 +21,7 @@ make deb
 dpkg-buildpackage -us -uc -b
 ```
 
-`make deb` produces `../sonic-smart-patch_3.1.0-1_all.deb` using `dpkg-deb` and the
+`make deb` produces `../sonic-smart-patch_3.1.1-1_all.deb` using `dpkg-deb` and the
 same runtime sources and assets. The standard SONiC build uses `debian/rules`.
 The architecture-independent package requires Python 3.9+, requests, PyYAML and
 Click. SONiC provides ConfigDB/STATE_DB connectors and the native command loader.
@@ -36,7 +36,7 @@ no compatibility aliases or automatic state import.
 The default remains disabled/advisory, with maintenance checks disabled.
 
 ```sh
-sudo dpkg -i sonic-smart-patch_3.1.0-1_all.deb
+sudo dpkg -i sonic-smart-patch_3.1.1-1_all.deb
 sudo config security service-url "https://<server-ip>:8000"
 sudo config security auth-token --token-file /secure/path/device-token
 sudo config security setting ca_bundle /etc/sonic/smart-patch/service-ca.pem
@@ -329,6 +329,23 @@ changed exact-target inventory and a complete current central scan after the loc
 installation report. `no_longer_reported` is distinct from verified closure. Later
 rollback/failure and recurring findings retain their history without falsely keeping
 a current resolved result.
+
+## Container staging on runtime-mounted temporary directories
+
+Smart Patch **3.1.1** fixes a staging failure seen when `/var/tmp` is mounted as
+tmpfs inside a running container. APT can download the exact package successfully,
+while a subsequent `docker cp` operation cannot find that runtime-mounted path
+through Docker's archive view. This is an archive-transfer failure during staging;
+it does not establish a permission or `sudo` failure, and staging has not installed
+the target package.
+
+Version 3.1.1 transfers staging archives through the running container's mount view
+while retaining exact container and package identity checks. Upgrade the collector
+to `sonic-smart-patch_3.1.1-1_all.deb`, preserving its enrollment and journals. Create
+a fresh plan from the current finding and retry staging through the normal CLI or
+service workflow. The upgrade does not automatically retry a failed action, approve
+installation, recreate the container or restart its service. Inspect
+`security show remediation --scope container:<name> --json` for the current result.
 
 ## Exact previous Debian packages from snapshots
 

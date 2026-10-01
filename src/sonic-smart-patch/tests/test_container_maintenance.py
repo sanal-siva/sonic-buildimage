@@ -1,6 +1,7 @@
 """Exercise selected-container transactions with synthetic package boundaries."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -33,19 +34,32 @@ class ContainerRunner:
                 raise RuntimeError("Selected container did not restart")
             self.identity["pid"] += 1
             return self.identity["id"]
-        if argv[:2] == ["docker", "cp"]:
-            if ":" in argv[2]:
-                source = self.root / argv[2].split(":", 1)[1].lstrip("/").rstrip(".")
-                for item in source.glob("*.deb"):
-                    shutil.copyfile(item, Path(argv[3]) / item.name)
-            else:
-                target = self.root / argv[3].split(":", 1)[1].lstrip("/")
-                shutil.copyfile(argv[2], target)
-            return ""
         if argv[:2] == ["dpkg-deb", "-f"]:
             data = json.loads(Path(argv[2]).read_text())
             return "Package: socat\nVersion: %s\n" % data["version"]
         raise AssertionError("Unexpected host command: " + repr(argv))
+
+    def _runtime(self, identity):
+        outer = self
+        class Root:
+            def __enter__(self):
+                self.root = os.open(outer.root, os.O_RDONLY | os.O_DIRECTORY)
+                return self
+            def verify(self):
+                assert identity["id"] == outer.identity["id"]
+            def __exit__(self, *_):
+                os.close(self.root)
+        return Root()
+
+    def copy_from_container(self, identity, source, destination, **options):
+        from smart_patch.container_artifacts import copy_from_container
+        self.calls.append(("host", ["artifact-export", identity["id"], source, str(destination)], options))
+        return copy_from_container(identity, source, str(destination), runtime_factory=self._runtime)
+
+    def copy_to_container(self, identity, source, destination, sha256, **options):
+        from smart_patch.container_artifacts import copy_to_container
+        self.calls.append(("host", ["artifact-import", identity["id"], source, destination], options))
+        return copy_to_container(identity, source, destination, sha256, runtime_factory=self._runtime)
 
     def container(self, identity, argv, **options):
         assert identity["id"] == self.identity["id"]
@@ -195,6 +209,21 @@ class ContainerMaintenanceTests(unittest.TestCase):
         result = self.engine._load(self.plan["id"])
         self.assertEqual(result["revision"], revision + 70)
         self.assertLessEqual(len(result["history"]), 64)
+
+    def test_staged_artifacts_repopulate_runtime_cache_before_install_and_rollback(self):
+        self.enable()
+        staged = self.engine.stage(self.plan["id"])
+        self.assertTrue(staged["rollback_available"])
+        cache = self.runner.root / "var/tmp" / ("sonic-smart-patch-" + self.plan["id"])
+        shutil.rmtree(cache / "forward")
+        installed = self.engine.apply(self.plan["id"], approved=True)
+        self.assertEqual(installed["status"], "pending_reassessment")
+        self.assertEqual(self.runner.version, "1.1")
+        shutil.rmtree(cache / "rollback")
+        rolled = self.engine.rollback(self.plan["id"])
+        self.assertEqual(rolled["status"], "rolled_back")
+        self.assertEqual(self.runner.version, "1.0")
+        self.assertFalse(any(argv[:2] == ["docker", "cp"] for _, argv, _ in self.runner.calls))
 
     def test_maintenance_revoked_after_install_records_failure_without_false_denial(self):
         self.enable()

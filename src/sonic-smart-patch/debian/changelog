@@ -1,3 +1,11 @@
+sonic-smart-patch (3.1.1-1) unstable; urgency=medium
+
+  * Fix container staging archive transfer when the download directory is a
+    runtime-mounted tmpfs that is absent from Docker's archive view.
+  * Preserve exact container and package identity checks during archive transfer.
+
+ -- SONiC Contributors <dev@sonicdev.org>  Thu, 01 Oct 2026 12:47:18 +0000
+
 sonic-smart-patch (3.1.0-1) unstable; urgency=medium
 
   * Add explicit maintenance-mode container updates with bounded namespace

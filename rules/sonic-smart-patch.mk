@@ -1,5 +1,5 @@
 # Optional lightweight host collector. Vulnerability scanners run centrally.
-SONIC_SMART_PATCH_VERSION = 3.1.0-1
+SONIC_SMART_PATCH_VERSION = 3.1.1-1
 SONIC_SMART_PATCH = sonic-smart-patch_$(SONIC_SMART_PATCH_VERSION)_all.deb
 $(SONIC_SMART_PATCH)_SRC_PATH = $(SRC_PATH)/sonic-smart-patch
 $(SONIC_SMART_PATCH)_VERSION = $(SONIC_SMART_PATCH_VERSION)

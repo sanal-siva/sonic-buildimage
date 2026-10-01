@@ -294,7 +294,7 @@ class RemediationEngine:
             self._run(plan, ["mkdir", "-p", container_directory])
             self._run(plan, ["apt-get", "download", target], cwd=container_directory, timeout=180, limit=1048576)
             self._require_scope(plan)
-            self.runner(["docker", "cp", plan["container_identity"]["id"] + ":" + container_directory + "/.", str(directory)], timeout=180)
+            self.runner.copy_from_container(plan["container_identity"], container_directory, directory, timeout=180)
         matches = []
         for artifact in directory.glob("*.deb"):
             fields = self.runner(["dpkg-deb", "-f", str(artifact), "Package", "Version"]).splitlines()
@@ -396,7 +396,7 @@ class RemediationEngine:
             for artifact in artifacts:
                 target = container_directory + "/" + Path(artifact["path"]).name
                 self._require_scope(plan)
-                self.runner(["docker", "cp", artifact["path"], plan["container_identity"]["id"] + ":" + target], timeout=120)
+                self.runner.copy_to_container(plan["container_identity"], artifact["path"], target, artifact["sha256"], timeout=120)
                 paths.append(target)
             cache_options = ["-o", "Dir::Cache::Archives=" + container_directory]
         else:

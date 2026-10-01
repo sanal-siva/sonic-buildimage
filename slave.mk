@@ -1780,7 +1780,7 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 	$(foreach kv,$(SONIC_INSTALLER_EXTRA_EXPORTS),export $(kv);)
 	export kube_docker_proxy="$(KUBE_DOCKER_PROXY)"
 	export enable_pfcwd_on_start="$(ENABLE_PFCWD_ON_START)"
-	export installer_debs="$(addprefix $(IMAGE_DISTRO_DEBS_PATH)/,$($*_INSTALLS) $(FIPS_BASEIMAGE_INSTALLERS) $(SOCAT))"
+	export installer_debs="$(addprefix $(IMAGE_DISTRO_DEBS_PATH)/,$($*_INSTALLS) $(FIPS_BASEIMAGE_INSTALLERS) $(SOCAT) $(SONIC_INSTALLER_EXTRA_DEBS))"
 	export installer_python_debs="$(addprefix $(IMAGE_DISTRO_DEBS_PATH)/,$(FIPS_BASEIMAGE_PYTHON_INSTALLERS))"
 	export lazy_installer_debs="$(foreach deb, $($*_LAZY_INSTALLS),$(foreach device, $($(deb)_PLATFORM),$(addprefix $(device)@, $(IMAGE_DISTRO_DEBS_PATH)/$(deb))))"
 	export lazy_build_installer_debs="$(foreach deb, $($*_LAZY_BUILD_INSTALLS), $(addprefix $($(deb)_MACHINE)|,$(deb)))"
@@ -1992,9 +1992,15 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 		CONFIGURED_PLATFORM="$(CONFIGURED_PLATFORM)" \
 		SONIC_VERSION_CONTROL_COMPONENTS="$(SONIC_VERSION_CONTROL_COMPONENTS)" \
 		SBOM_INSTALLER_DOCKERS="$($*_DOCKERS)" \
-		SBOM_INSTALLER_DEBS="$($*_INSTALLS) $($*_LAZY_INSTALLS) $($*_LAZY_BUILD_INSTALLS)" \
+		SBOM_INSTALLER_DEBS="$($*_INSTALLS) $($*_LAZY_INSTALLS) $($*_LAZY_BUILD_INSTALLS) $(SONIC_INSTALLER_EXTRA_DEBS)" \
 		SBOM_INSTALLER_WHEELS="$($*_PYTHON_WHEELS)" \
 			./scripts/build_sbom.sh $(LOG)
+
+		if [ "$(INCLUDE_SONIC_GUARDIAN)" = "y" ]; then
+			python3 src/sonic-guardian/scripts/guardian-manifest.py \
+				--manifest "$(TARGET_PATH)/guardian-$(dep_machine).manifest.json" \
+				--artifact "$(TARGET_PATH)/$(subst $($*_MACHINE),$(dep_machine),$*)" $(LOG)
+		fi
 	)
 
 	$(foreach docker, $($*_DOCKERS), \

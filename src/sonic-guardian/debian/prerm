@@ -1,20 +1,10 @@
-#!/bin/bash
-# SONiC Guardian prerm script - removes apt/dpkg hooks
-
+#!/bin/sh
 set -e
-
-echo "Removing SONiC Guardian apt/dpkg hooks..."
-
-# Remove apt hook configuration
-rm -f /etc/apt/apt.conf.d/50sonic-guardian-hooks
-echo "Removed apt hook configuration"
-
-# Remove dpkg hooks
-rm -f /etc/dpkg/post-update.d/sonic-guardian-update
-echo "Removed dpkg hooks"
-
-# Note: /etc/sonic/guardian metadata directory is preserved for audit trail
-# Users can manually remove it if desired
-
-echo "SONiC Guardian hooks removed successfully"
-exit 0
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl stop sonic-guardian.service || true
+    fi
+    python3 /usr/share/sonic-guardian/install-plugins.py --remove
+    python3 /usr/share/sonic-guardian/install-yang.py --remove
+fi
+#DEBHELPER#

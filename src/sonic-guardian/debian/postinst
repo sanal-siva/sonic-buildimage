@@ -1,66 +1,11 @@
-#!/bin/bash
-# SONiC Guardian postinst script - installs apt/dpkg hooks
-
+#!/bin/sh
 set -e
-
-HOOKS_DIR="/etc/apt/apt.conf.d"
-HOOK_FILE="$HOOKS_DIR/50sonic-guardian-hooks"
-HOOK_HANDLER="/usr/lib/sonic-guardian/dpkg-hook-handler.py"
-
-echo "Installing SONiC Guardian apt/dpkg hooks..."
-
-# Create hook configuration file
-cat > "$HOOK_FILE" << 'EOF'
-// SONiC Guardian hooks for real-time package metadata tracking
-// These hooks update the delta metadata file whenever packages are
-// installed, removed, or upgraded
-
-DPkg {
-    Pre-Install-Pkgs {
-        "python3 -m guardian.hooks 2>&1 | logger -t sonic-guardian-hook";
-    };
-    Post-Invoke {
-        "python3 -m guardian.hooks 2>&1 | logger -t sonic-guardian-hook";
-    };
-};
-
-// Trigger metadata refresh after each apt transaction
-APT::Update::Post-Invoke-Success {
-    "python3 -m guardian.hooks post-apt 2>&1 | logger -t sonic-guardian-hook";
-};
-EOF
-
-chmod 644 "$HOOK_FILE"
-echo "Installed apt hook configuration: $HOOK_FILE"
-
-# Create dpkg hook directory
-DPKG_HOOKS_DIR="/etc/dpkg/post-update.d"
-mkdir -p "$DPKG_HOOKS_DIR"
-
-# Create dpkg post-update hook
-cat > "$DPKG_HOOKS_DIR/sonic-guardian-update" << 'EOF'
-#!/bin/bash
-# SONiC Guardian dpkg post-update hook
-# Refreshes metadata after dpkg transactions
-
-export HOOK_ACTION="update"
-export DPKG_MAINTSCRIPT_NAME="post"
-
-python3 -m guardian.hooks 2>&1 | logger -t sonic-guardian-hook
-
-exit 0
-EOF
-
-chmod 755 "$DPKG_HOOKS_DIR/sonic-guardian-update"
-echo "Installed dpkg post-update hook: $DPKG_HOOKS_DIR/sonic-guardian-update"
-
-# Create metadata directory
-mkdir -p /etc/sonic/guardian
-chmod 755 /etc/sonic/guardian
-
-# Create VEX directory
-mkdir -p /etc/sonic/vex
-chmod 755 /etc/sonic/vex
-
-echo "SONiC Guardian hooks installed successfully"
-exit 0
+if [ "$1" = configure ]; then
+    install -d -m 0755 /var/lib/sonic-guardian /etc/sonic/guardian
+    python3 /usr/share/sonic-guardian/install-plugins.py
+    python3 /usr/share/sonic-guardian/install-yang.py
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
+fi
+#DEBHELPER#

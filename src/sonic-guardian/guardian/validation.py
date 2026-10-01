@@ -1,227 +1,175 @@
-"""Health check validation engine for post-remediation verification"""
+"""Baseline-relative SONiC health checks. Missing evidence never passes."""
+import json
+import re
+import shutil
+import time
+from pathlib import Path
+from guardian.config import ConfigManager
+from guardian.collector import run
+from guardian.storage import now
 
-import subprocess
-from typing import Dict, List, Any
-from datetime import datetime
 
-from guardian.models import HealthCheckResult
-from guardian.exceptions import ValidationError
-from guardian.logging import setup_logging
-
-logger = setup_logging(__name__)
+def routing_counts(value, require_prefix_counts=False, path=""):
+    counts, errors = {}, []
+    def number(item):
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, int) and item >= 0:
+            return item
+        if isinstance(item, str) and item.isdigit():
+            return int(item)
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            location = path+"/"+key
+            if key == "peers" and isinstance(item, dict):
+                for address, peer in item.items():
+                    if not isinstance(peer, dict) or peer.get("state") != "Established":
+                        continue
+                    count = number(peer.get("pfxRcd"))
+                    if count is None:
+                        if require_prefix_counts:
+                            errors.append("Prefix count unavailable for established peer: "+location+"/"+address)
+                    else:
+                        counts[location+"/"+address+"/pfxRcd"] = count
+            elif key in ("ribCount", "routeCount", "prefixCount", "totalPrefixes"):
+                count = number(item)
+                if count is not None:
+                    counts[location] = count
+                elif require_prefix_counts:
+                    errors.append("Declared route total is invalid: "+location)
+            else:
+                nested, failures = routing_counts(item, require_prefix_counts, location)
+                counts.update(nested)
+                errors.extend(failures)
+    return counts, errors
 
 
 class ValidationEngine:
-    """Performs comprehensive health checks after remediation"""
+    def __init__(self, runner=run, config=None, resource_reader=None):
+        self.runner = runner
+        self.config = config or ConfigManager()
+        self.resource_reader = resource_reader or self._resources
 
-    def run_health_checks(self) -> tuple[bool, List[HealthCheckResult]]:
-        """Run all health checks and aggregate results
+    def _resources(self):
+        def cpu():
+            line = Path("/proc/stat").read_text().splitlines()[0].split()
+            values = [int(value) for value in line[1:9]]
+            return sum(values), values[3]+values[4]
+        total_before, idle_before = cpu()
+        time.sleep(0.1)
+        total_after, idle_after = cpu()
+        if total_after <= total_before:
+            raise ValueError("CPU utilization sample is unavailable")
+        memory = {line.split(":",1)[0]:int(line.split(":",1)[1].split()[0])*1024
+                  for line in Path("/proc/meminfo").read_text().splitlines() if ":" in line}
+        if not memory.get("MemTotal") or "MemAvailable" not in memory:
+            raise ValueError("Memory availability is unknown")
+        path = self.config.values().get("validation_disk_path", "/var/lib/sonic-guardian")
+        disk = shutil.disk_usage(path)
+        return {"cpu_percent":round(100*(1-(idle_after-idle_before)/(total_after-total_before)),2),
+                "memory_percent":round(100*(1-memory["MemAvailable"]/memory["MemTotal"]),2),
+                "disk_percent":round(100*disk.used/disk.total,2), "disk_free_bytes":disk.free,
+                "disk_path":path, "cpu_sample_seconds":0.1}
 
-        Returns:
-            (all_passed: bool, results: List[HealthCheckResult])
-        """
-        results = []
-        all_passed = True
+    def _services_and_resources(self, result):
+        config = self.config.values()
+        names = [name.strip() for name in config.get("validation_services", "ssh,database,swss,syncd,bgp").split(",") if name.strip()]
+        result["services"] = {}
+        if not names or len(names)>16 or any(not re.fullmatch(r"[A-Za-z0-9_.@:-]+", name) for name in names):
+            result["errors"].append("Invalid or empty critical service policy")
+        else:
+            for name in names:
+                try:
+                    text = self.runner(["systemctl", "show", name, "--property=LoadState", "--property=ActiveState"], timeout=3, limit=4096)
+                    values = dict(line.split("=",1) for line in text.splitlines() if "=" in line)
+                    result["services"][name] = {"load_state":values.get("LoadState", "unknown"), "active_state":values.get("ActiveState", "unknown")}
+                    if values.get("LoadState") != "loaded" or values.get("ActiveState") != "active":
+                        result["errors"].append("Critical service is unavailable or inactive: "+name)
+                except Exception as error:
+                    result["services"][name] = {"load_state":"unknown", "active_state":"unknown"}
+                    result["errors"].append("Critical service could not be verified: "+name+": "+str(error))
+        try:
+            result["resources"] = self.resource_reader()
+            result["resource_thresholds"] = {metric:int(config.get("validation_"+metric+"_max_pct", default))
+                                              for metric,default in (("cpu",80),("memory",90),("disk",85))}
+            for metric, maximum in result["resource_thresholds"].items():
+                value = result["resources"].get(metric+"_percent")
+                if not 1 <= maximum <= 100 or not isinstance(value,(int,float)) or not 0 <= value <= 100:
+                    result["errors"].append("Resource measurement or threshold is invalid: "+metric)
+                elif value > maximum:
+                    result["errors"].append("Resource threshold exceeded: %s %.2f%% > %s%%" % (metric,value,maximum))
+        except Exception as error:
+            result["resources"] = {"status":"unknown"}
+            result["errors"].append("Resources could not be verified: "+str(error))
 
-        checks = [
-            self.check_service_health,
-            self.check_routing_status,
-            self.check_interface_status,
-            self.check_resource_utilization,
-        ]
-
-        for check_func in checks:
+    def snapshot(self):
+        result = {"observed_at": now(), "errors": []}
+        self._services_and_resources(result)
+        for name, argv in {"interfaces": ["ip", "-j", "link", "show"],
+                           "containers": ["docker", "ps", "--format", "{{.Names}}"]}.items():
             try:
-                result = check_func()
-                results.append(result)
-                if result.status != "PASS":
-                    all_passed = False
-            except Exception as e:
-                logger.error(f"Health check {check_func.__name__} failed: {e}")
-                result = HealthCheckResult(
-                    check_type=check_func.__name__,
-                    status="FAIL",
-                    checked_at=datetime.utcnow().isoformat() + "Z",
-                    error_message=str(e),
-                )
-                results.append(result)
-                all_passed = False
-
-        logger.info(f"Health checks: {sum(1 for r in results if r.status == 'PASS')}/{len(results)} PASS")
-        return all_passed, results
-
-    def check_service_health(self) -> HealthCheckResult:
-        """Verify critical SONiC services are running
-
-        Returns:
-            HealthCheckResult for service health
-        """
-        critical_services = ["sshd", "swss", "syncd", "bgpd", "telemetry"]
-        failed_services = []
-
-        for service in critical_services:
-            try:
-                result = subprocess.run(
-                    ["systemctl", "is-active", service],
-                    capture_output=True,
-                    timeout=5,
-                )
-                if result.returncode != 0:
-                    failed_services.append(service)
-            except Exception as e:
-                logger.warning(f"Failed to check {service}: {e}")
-                failed_services.append(service)
-
-        status = "PASS" if not failed_services else "FAIL"
-        return HealthCheckResult(
-            check_type="service_health",
-            status=status,
-            checked_at=datetime.utcnow().isoformat() + "Z",
-            details={
-                "services_healthy": len(critical_services) - len(failed_services),
-                "services_failed": len(failed_services),
-                "failed_services": failed_services,
-            },
-        )
-
-    def check_routing_status(self) -> HealthCheckResult:
-        """Verify routing convergence and BGP status
-
-        Returns:
-            HealthCheckResult for routing health
-        """
+                value = self.runner(argv, timeout=10, limit=262144)
+                result[name] = json.loads(value) if name == "interfaces" else sorted(value.splitlines())
+            except Exception as error:
+                result["errors"].append(name + ": " + str(error))
+        result["bgp"] = {}
+        for name in result.get("containers", []):
+            if name == "bgp" or name.startswith("bgp") and name[3:].isdigit():
+                try:
+                    result["bgp"][name] = json.loads(self.runner(["docker", "exec", name, "vtysh", "-c", "show bgp summary json"], timeout=15, limit=1048576))
+                except Exception as error:
+                    result["errors"].append("bgp:" + name + ": " + str(error))
+        config = self.config.values()
+        result["require_prefix_counts"] = config.get("validation_require_prefix_counts", "true") == "true"
         try:
-            # Check BGP neighbors convergence
-            result = subprocess.run(
-                ["vtysh", "-c", "show ip bgp summary"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            result["routing_prefix_loss_pct"] = int(config.get("validation_prefix_loss_pct", "0"))
+            if not 0 <= result["routing_prefix_loss_pct"] <= 100:
+                raise ValueError("Prefix loss tolerance must be between 0 and 100")
+        except ValueError as error:
+            result["errors"].append(str(error))
+            result["routing_prefix_loss_pct"] = 0
+        result["routing_counts"], count_errors = routing_counts(result["bgp"], result["require_prefix_counts"])
+        result["errors"].extend(count_errors)
+        return result
 
-            if result.returncode == 0:
-                output = result.stdout
-                # Basic check for established neighbors
-                established = output.count("Established")
-                return HealthCheckResult(
-                    check_type="routing_status",
-                    status="PASS",
-                    checked_at=datetime.utcnow().isoformat() + "Z",
-                    details={"established_neighbors": established},
-                )
-            else:
-                return HealthCheckResult(
-                    check_type="routing_status",
-                    status="FAIL",
-                    checked_at=datetime.utcnow().isoformat() + "Z",
-                    error_message="Failed to get BGP status",
-                )
-        except Exception as e:
-            logger.warning(f"Routing check failed: {e}")
-            return HealthCheckResult(
-                check_type="routing_status",
-                status="PASS",
-                checked_at=datetime.utcnow().isoformat() + "Z",
-                details={"note": "Could not verify routing (vtysh unavailable)"},
-            )
+    @staticmethod
+    def compare(before, after):
+        errors = list(before.get("errors", [])) + list(after.get("errors", []))
+        missing = set(before.get("containers", [])) - set(after.get("containers", []))
+        if missing:
+            errors.append("Previously running containers unavailable: " + ",".join(sorted(missing)))
+        old = {link["ifname"] for link in before.get("interfaces", []) if link.get("operstate") == "UP"}
+        new = {link["ifname"] for link in after.get("interfaces", []) if link.get("operstate") == "UP"}
+        if old - new:
+            errors.append("Previously operational interfaces down: " + ",".join(sorted(old-new)))
+        def peers(value, prefix=""):
+            found = {}
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "peers" and isinstance(item, dict):
+                        for address, peer in item.items():
+                            found[prefix + "/" + address] = peer.get("state")
+                    else:
+                        found.update(peers(item, prefix + "/" + key))
+            return found
+        previous_counts, previous_errors = routing_counts(before.get("bgp", {}), before.get("require_prefix_counts", False))
+        current_counts, current_errors = routing_counts(after.get("bgp", {}), before.get("require_prefix_counts", False))
+        errors.extend(previous_errors+current_errors)
+        tolerance = before.get("routing_prefix_loss_pct", 0)
+        for route, count in previous_counts.items():
+            current = current_counts.get(route)
+            if current is None:
+                errors.append("Baseline route/prefix measurement disappeared: "+route)
+            elif current < count*(1-tolerance/100):
+                errors.append("Route/prefix count decreased beyond tolerance: %s %d -> %d" % (route,count,current))
+        previous_peers = peers(before.get("bgp", {}))
+        current_peers = peers(after.get("bgp", {}))
+        for peer, state in previous_peers.items():
+            if state == "Established" and current_peers.get(peer) != state:
+                errors.append("Previously established BGP peer lost: " + peer)
+        return {"status": "PASS" if not errors else "FAIL", "errors": errors, "checked_at": now()}
 
-    def check_interface_status(self) -> HealthCheckResult:
-        """Verify network interface status
-
-        Returns:
-            HealthCheckResult for interface health
-        """
-        try:
-            result = subprocess.run(
-                ["ip", "link", "show"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-
-            if result.returncode == 0:
-                output = result.stdout
-                up_interfaces = output.count("UP")
-                down_interfaces = output.count("DOWN")
-
-                # Some DOWN is acceptable (disabled ports), but not many
-                status = "PASS" if down_interfaces < 20 else "FAIL"
-                return HealthCheckResult(
-                    check_type="interface_status",
-                    status=status,
-                    checked_at=datetime.utcnow().isoformat() + "Z",
-                    details={"up_interfaces": up_interfaces, "down_interfaces": down_interfaces},
-                )
-            else:
-                return HealthCheckResult(
-                    check_type="interface_status",
-                    status="FAIL",
-                    checked_at=datetime.utcnow().isoformat() + "Z",
-                    error_message="Failed to get interface status",
-                )
-        except Exception as e:
-            logger.warning(f"Interface check failed: {e}")
-            return HealthCheckResult(
-                check_type="interface_status",
-                status="PASS",
-                checked_at=datetime.utcnow().isoformat() + "Z",
-                details={"note": "Could not verify interfaces (ip unavailable)"},
-            )
-
-    def check_resource_utilization(self) -> HealthCheckResult:
-        """Check CPU, memory, and disk utilization
-
-        Returns:
-            HealthCheckResult for resource health
-        """
-        try:
-            # Check memory
-            with open("/proc/meminfo") as f:
-                meminfo = {}
-                for line in f:
-                    key, value = line.split(":")
-                    meminfo[key.strip()] = int(value.split()[0])
-
-            mem_used_pct = (
-                (meminfo.get("MemTotal", 0) - meminfo.get("MemAvailable", 0))
-                / meminfo.get("MemTotal", 1)
-                * 100
-            )
-
-            # Check disk
-            result = subprocess.run(
-                ["df", "-h", "/"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            disk_used_pct = 0
-            if result.returncode == 0:
-                lines = result.stdout.split("\n")
-                if len(lines) > 1:
-                    parts = lines[1].split()
-                    if len(parts) > 4:
-                        disk_used_pct = int(parts[4].rstrip("%"))
-
-            # Determine status
-            status = "PASS"
-            if mem_used_pct > 90 or disk_used_pct > 85:
-                status = "FAIL"
-
-            return HealthCheckResult(
-                check_type="resource_utilization",
-                status=status,
-                checked_at=datetime.utcnow().isoformat() + "Z",
-                details={
-                    "memory_used_percent": round(mem_used_pct, 1),
-                    "disk_used_percent": disk_used_pct,
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Resource check failed: {e}")
-            return HealthCheckResult(
-                check_type="resource_utilization",
-                status="PASS",
-                checked_at=datetime.utcnow().isoformat() + "Z",
-                details={"note": "Could not verify resources"},
-            )
+    def run_health_checks(self):
+        snapshot = self.snapshot()
+        return not snapshot["errors"], snapshot

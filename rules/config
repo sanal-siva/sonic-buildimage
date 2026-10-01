@@ -458,3 +458,7 @@ SBOM_INCLUDE_LICENSES ?= y
 # (SPDX conversion, provenance emit, license resolution) always
 # warn-and-continue regardless.
 SBOM_STRICT ?= y
+
+# Install the resource-bounded Guardian collector and embed build identity.
+# Enable SBOM generation separately for artifact-backed central assessment.
+INCLUDE_SONIC_GUARDIAN ?= n

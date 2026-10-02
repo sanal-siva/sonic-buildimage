@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-destination = root.parent / "sonic-smart-patch_3.0.0-1_all.deb"
+destination = root.parent / "sonic-smart-patch_3.1.1-1_all.deb"
 with tempfile.TemporaryDirectory(prefix="smart-patch-deb-") as temporary:
     stage = Path(temporary)
     stage.chmod(0o755)
@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix="smart-patch-deb-") as temporary:
     shutil.copytree(root / "smart_patch", stage / "usr/lib/python3/dist-packages/smart_patch", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     control = (root / "debian/control").read_text().split("Package: ", 1)[1]
     control = "Package: " + control.replace("${python3:Depends}, ${misc:Depends}, ", "")
-    control = control.replace("Architecture: all", "Version: 3.0.0-1\nArchitecture: all\nMaintainer: SONiC Contributors <dev@sonicdev.org>")
+    control = control.replace("Architecture: all", "Version: 3.1.1-1\nArchitecture: all\nMaintainer: SONiC Contributors <dev@sonicdev.org>")
     (stage / "DEBIAN").mkdir()
     (stage / "DEBIAN/control").write_text(control)
     for name in ("postinst", "prerm"):

@@ -4,6 +4,7 @@ module sonic-smart-patch {
     prefix smart_patch;
     description "Resource-bounded security inventory and evidence collection.";
     revision 2026-10-01 { description "SONiC Smart Patch package and configuration namespace."; }
+    revision 2026-10-01 { description "Explicit maintenance permission for scoped container package updates and restart."; }
     revision 2026-09-30 { description "Configurable maintenance checks, CPU quota and free-space threshold."; }
     revision 2026-09-29 { description "Initial Smart Patch remote-assessment configuration."; }
     container sonic-smart-patch {
@@ -21,7 +22,22 @@ module sonic-smart-patch {
                 leaf maintenance_checks_enabled {
                     type boolean;
                     default false;
-                    description "Enable local maintenance preflight and health checks. When false, missing rollback artifacts and failed optional checks do not block maintenance. Authentication, operating mode, explicit approval and supported host-package boundaries still apply.";
+                    description "Enable local maintenance preflight and health checks. When false, missing rollback artifacts and failed optional checks do not block maintenance. Authentication, operating mode, explicit approval, protected-package boundaries and mandatory container identity/restart checks still apply.";
+                }
+                leaf maintenance_mode {
+                    type boolean;
+                    default false;
+                    description "Permit exact-version updates inside a selected running container and restart that container. Does not drain traffic or change SONiC routing maintenance configuration. Must remain enabled through staging, installation and restart.";
+                }
+                leaf rollback_snapshot_enabled {
+                    type boolean;
+                    default true;
+                    description "Try the official signed Debian snapshot archive when an exact rollback package is absent from configured APT repositories.";
+                }
+                leaf rollback_snapshot_timestamp {
+                    type string { pattern '([0-9]{8}T[0-9]{6}Z)?'; }
+                    default "";
+                    description "Optional official Debian snapshot timestamp YYYYMMDDThhmmssZ. Empty selects an archive date for the exact old version automatically.";
                 }
                 leaf maintenance_cpu_quota_percent {
                     type uint8 { range "0..100"; }

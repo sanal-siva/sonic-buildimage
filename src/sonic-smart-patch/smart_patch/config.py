@@ -13,13 +13,14 @@ DEFAULTS = {"enabled": "false", "mode": "advisory", "sync_interval": "60",
             "inventory_interval": "900", "min_available_mb": "256",
             "allow_http": "false", "max_components": "20000",
             "maintenance_cpu_quota_percent": "0", "maintenance_min_free_mib": "500",
-            "maintenance_checks_enabled": "false",
+            "maintenance_checks_enabled": "false", "maintenance_mode": "false",
+            "rollback_snapshot_enabled": "true", "rollback_snapshot_timestamp": "",
             "validation_services":"ssh,database,swss,syncd,bgp", "validation_cpu_max_pct":"80",
             "validation_memory_max_pct":"90", "validation_disk_max_pct":"85",
             "validation_disk_path":"/var/lib/sonic-smart-patch", "validation_prefix_loss_pct":"0",
             "validation_require_prefix_counts":"true"}
 
-PUBLIC_FIELDS = ("enabled", "mode", "sync_interval", "maintenance_checks_enabled")
+PUBLIC_FIELDS = ("enabled", "mode", "sync_interval", "maintenance_checks_enabled", "maintenance_mode")
 
 
 class ConfigManager:

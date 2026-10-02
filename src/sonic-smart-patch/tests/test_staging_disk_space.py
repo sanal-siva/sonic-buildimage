@@ -89,10 +89,10 @@ class StagingDiskSpaceTests(unittest.TestCase):
     def test_container_maintenance_cannot_claim_a_host_cpu_budget(self):
         self.engine._save({**self.plan, "scope": "container:pmon"})
         with patch.object(self.engine, "_transaction") as transaction:
-            with self.assertRaisesRegex(ValueError, "host packages only"):
+            with self.assertRaisesRegex(ValueError, "maintenance mode"):
                 self.engine.stage(self.plan["id"])
             self.engine._save({**self.plan, "scope": "container:pmon", "status": "staged"})
-            with self.assertRaisesRegex(ValueError, "host packages only"):
+            with self.assertRaisesRegex(ValueError, "maintenance mode"):
                 self.engine.apply(self.plan["id"], approved=True)
             transaction.assert_not_called()
 

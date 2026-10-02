@@ -70,6 +70,19 @@ def smart_patch_mode(mode):
     click.echo("Smart Patch operating mode saved")
 
 
+@configure_smart_patch.command(name="maintenance-mode")
+@click.argument("action", type=click.Choice(["enable", "disable"]))
+@guarded
+def maintenance_mode(action):
+    """Permit scoped container package maintenance and its container restart.
+
+    This flag does not drain traffic or place routing protocols in maintenance.
+    """
+    ConfigManager().set("", "", "maintenance_mode", "true" if action == "enable" else "false")
+    click.echo("Smart Patch maintenance mode %s. This does not drain network traffic." % (
+        "enabled" if action == "enable" else "disabled"))
+
+
 @config.command(name="service-url")
 @click.argument("url")
 @guarded
@@ -90,7 +103,7 @@ def auth_token(token_file, token):
 
 
 @config.command(name="setting")
-@click.argument("name", type=click.Choice(["ca_bundle", "sync_interval", "inventory_interval", "min_available_mb", "allow_http", "autonomous_allowlist", "maintenance_cpu_quota_percent", "maintenance_min_free_mib", "maintenance_checks_enabled", "validation_services", "validation_cpu_max_pct", "validation_memory_max_pct", "validation_disk_max_pct", "validation_disk_path", "validation_prefix_loss_pct", "validation_require_prefix_counts"]))
+@click.argument("name", type=click.Choice(["ca_bundle", "sync_interval", "inventory_interval", "min_available_mb", "allow_http", "autonomous_allowlist", "maintenance_cpu_quota_percent", "maintenance_min_free_mib", "maintenance_checks_enabled", "rollback_snapshot_enabled", "rollback_snapshot_timestamp", "validation_services", "validation_cpu_max_pct", "validation_memory_max_pct", "validation_disk_max_pct", "validation_disk_path", "validation_prefix_loss_pct", "validation_require_prefix_counts"]))
 @click.argument("value")
 @guarded
 def setting(name, value):
@@ -105,6 +118,15 @@ def setting(name, value):
         raise ValueError("Maintenance free space must be between 1 and 65536 MiB")
     if name == "maintenance_checks_enabled" and value not in ("true", "false"):
         raise ValueError("Maintenance checks must be true or false")
+    if name == "rollback_snapshot_enabled" and value not in ("true", "false"):
+        raise ValueError("Rollback snapshot fallback must be true or false")
+    if name == "rollback_snapshot_timestamp" and value:
+        try:
+            parsed = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+            if parsed.strftime("%Y%m%dT%H%M%SZ") != value:
+                raise ValueError("Noncanonical snapshot timestamp")
+        except ValueError as error:
+            raise ValueError("Snapshot timestamp must be YYYYMMDDThhmmssZ or an empty string for automatic discovery") from error
     if name.endswith("_max_pct") and not 1 <= int(value) <= 100:
         raise ValueError("Validation percentage must be between 1 and 100")
     if name == "validation_prefix_loss_pct" and not 0 <= int(value) <= 100:
@@ -138,6 +160,7 @@ def status(as_json):
     result["enabled"] = config["enabled"]
     result["mode"] = config["mode"]
     result["maintenance_checks_enabled"] = config["maintenance_checks_enabled"]
+    result["maintenance_mode"] = config["maintenance_mode"]
     result["fresh"] = False
     if state.get("last_sync"):
         age = (datetime.now(timezone.utc)-datetime.fromisoformat(state["last_sync"])).total_seconds()
@@ -172,6 +195,36 @@ def findings(severity, as_json):
 
 
 show.add_command(findings, "vulnerabilities")
+
+
+@show.command(name="remediation")
+@click.option("--cve", help="Limit results to one CVE ID")
+@click.option("--scope", help="Limit to host or container:<name>")
+@click.option("--status", "state_filter", help="Limit to a lifecycle status, for example staged or completed")
+@click.option("--json", "as_json", is_flag=True)
+@guarded
+def remediation_status(cve, scope, state_filter, as_json):
+    """Show current CVEs and the progress/history of their remediation plans."""
+    from smart_patch.remediation_status import get_status
+    result = get_status(cve=cve, scope=scope, status=state_filter)
+    if as_json:
+        output(result)
+        return
+    click.echo("Smart Patch maintenance mode: %s; connection: %s" % (
+        result.get("maintenance_mode", False), result.get("sync_status", "unknown")))
+    if result.get("truncated"):
+        click.echo("The local cache is bounded; use the intelligent service for complete history.")
+    click.echo("%-22s %-22s %-22s %-24s %s" % ("CVE", "SCOPE", "PACKAGE", "STATE", "PLAN"))
+    for item in result.get("rows", []):
+        click.echo("%-22s %-22s %-22s %-24s %s" % (
+            item.get("cve_id", "unknown"), item.get("scope", "unknown"),
+            item.get("package_name", item.get("package", "unknown")), item.get("state", item.get("status", "unknown")),
+            item.get("plan_id") or item.get("local_plan_id") or "—"))
+    if not result.get("rows"):
+        click.echo("No matching cached findings or maintenance plans. This does not establish that the switch is free of vulnerabilities.")
+
+
+show.add_command(remediation_status, "cves")
 
 
 @show.command(name="finding")

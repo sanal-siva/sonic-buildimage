@@ -101,6 +101,47 @@ class MaintenanceConfigTests(unittest.TestCase):
                     result = self.invoke(name, value)
                     self.assertEqual(result.exit_code, 0, result.output)
 
+    def test_maintenance_mode_cli_is_explicit_and_public(self):
+        self.assertEqual(self.config.values()["maintenance_mode"], "false")
+        with patch("smart_patch.cli.ConfigManager", return_value=self.config):
+            result = CliRunner().invoke(self.root, ["security", "smart-patch", "maintenance-mode", "enable"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("does not drain", result.output)
+        self.assertEqual(self.database.entry["maintenance_mode"], "true")
+        self.assertEqual(public_config(self.directory.name)["maintenance_mode"], "true")
+        with patch("smart_patch.cli.ConfigManager", return_value=self.config):
+            result = CliRunner().invoke(self.root, ["security", "smart-patch", "maintenance-mode", "disable"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(public_config(self.directory.name)["maintenance_mode"], "false")
+
+    def test_snapshot_settings_validate_date_and_boolean(self):
+        self.assertEqual(self.config.values()["rollback_snapshot_enabled"], "true")
+        for value in ("20241222T205329Z", ""):
+            self.assertEqual(self.invoke("rollback_snapshot_timestamp", value).exit_code, 0)
+        for value in ("20249999T000000Z", "2024011T000000Z", "latest", "20240101T000000Z;evil"):
+            self.assertNotEqual(self.invoke("rollback_snapshot_timestamp", value).exit_code, 0)
+        self.assertEqual(self.invoke("rollback_snapshot_enabled", "false").exit_code, 0)
+        self.assertNotEqual(self.invoke("rollback_snapshot_enabled", "yes").exit_code, 0)
+
+    def test_remediation_cli_filters_and_displays_central_resolution(self):
+        from smart_patch.cli import security
+        projected = {"maintenance_mode": True, "sync_status": "connected", "truncated": False,
+                     "rows": [{"cve_id": "CVE-2026-12345", "scope": "container:pmon", "package_name": "socat",
+                               "status": "pending_reassessment", "state": "resolved", "plan_id": None,
+                               "local_plan_id": "11111111-1111-1111-1111-111111111111"}]}
+        with patch("smart_patch.remediation_status.get_status", return_value=projected) as get:
+            result = CliRunner().invoke(security, ["show", "remediation", "--cve", "CVE-2026-12345",
+                                                  "--scope", "container:pmon", "--status", "resolved"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        get.assert_called_once_with(cve="CVE-2026-12345", scope="container:pmon", status="resolved")
+        self.assertIn("resolved", result.output)
+        self.assertIn("11111111-1111-1111-1111-111111111111", result.output)
+        self.assertNotIn("pending_reassessment", result.output)
+        with patch("smart_patch.remediation_status.get_status", return_value=projected):
+            result = CliRunner().invoke(security, ["show", "cves", "--json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), projected)
+
 
 if __name__ == "__main__":
     unittest.main()

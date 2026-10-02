@@ -1,12 +1,14 @@
 """Maintenance budgets must not inherit the inventory collector's limits."""
 from pathlib import Path
+import json
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 from smart_patch.maintenance_resources import (
     MaintenanceCommandRunner, SYSTEMCTL, SYSTEMD_RUN, in_collector_cgroup,
-    systemd_available,
+    systemd_available, _container_entry, _compatible_security, _container_exec, _run_in_namespaces,
 )
 
 
@@ -16,6 +18,9 @@ class MaintenanceResourceTests(unittest.TestCase):
         self.config.values.return_value = {}
         self.process = Mock(return_value="APT result")
         self.command = MaintenanceCommandRunner(self.config, runner=self.process, available=True)
+        self.cgroup_fixture = patch("smart_patch.maintenance_resources._cgroup_v2", return_value=False)
+        self.cgroup_fixture.start()
+        self.addCleanup(self.cgroup_fixture.stop)
 
     def test_default_is_separate_memory_budget_without_cpu_quota(self):
         self.assertEqual(self.command(["apt-get", "-s", "install", "socat=1.1"], timeout=60, limit=1234), "APT result")
@@ -169,6 +174,144 @@ class MaintenanceResourceTests(unittest.TestCase):
                 patch.object(Path, "is_dir", return_value=True), \
                 patch("smart_patch.maintenance_resources._trusted_executable", return_value=True):
             self.assertTrue(systemd_available())
+
+    def test_container_process_runs_inside_host_bounded_unit_not_docker_exec(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
+        self.config.values.return_value = {"maintenance_cpu_quota_percent": "25"}
+        with patch("smart_patch.maintenance_resources._trusted_executable", return_value=True):
+            self.command.container(identity, ["apt-get", "download", "socat=1.1"], timeout=180, cwd="/var/tmp/stage")
+        argv = self.process.call_args.args[0]
+        self.assertEqual(argv[0], SYSTEMD_RUN)
+        self.assertIn("--property=MemoryMax=512M", argv)
+        self.assertIn("--property=CPUQuota=25%", argv)
+        self.assertIn("--property=RuntimeMaxSec=180s", argv)
+        self.assertIn("--property=DevicePolicy=strict", argv)
+        self.assertEqual([arg for arg in argv if arg.startswith("--property=DeviceAllow=")],
+                         ["--property=DeviceAllow=/dev/%s rw" % name for name in ("null", "zero", "full", "random", "urandom")])
+        self.assertIn("smart_patch.maintenance_resources", argv)
+        self.assertIn("--container", argv)
+        self.assertEqual(argv[-4:], ["/var/tmp/stage", "apt-get", "download", "socat=1.1"])
+        self.assertNotIn("exec", argv)
+
+    def test_container_never_falls_back_to_an_unbounded_process(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
+        command = MaintenanceCommandRunner(self.config, runner=self.process, available=False, in_collector=False)
+        with self.assertRaisesRegex(RuntimeError, "enforce package-process limits"):
+            command.container(identity, ["apt-get", "download", "socat=1.1"])
+        self.process.assert_not_called()
+
+    def test_artifact_transfer_uses_a_bounded_strict_device_worker(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/radv", "running": True, "pid": 12}
+        self.process.return_value = '{"files":[]}'
+        with patch("smart_patch.maintenance_resources._trusted_executable", return_value=True):
+            self.assertEqual(self.command.copy_from_container(identity, "/var/tmp/fixture", "/fixture/plans/cache"), {"files": []})
+        argv = self.process.call_args.args[0]
+        self.assertIn("smart_patch.container_artifacts", argv)
+        self.assertIn("export", argv)
+        self.assertIn("--property=MemoryMax=512M", argv)
+        self.assertIn("--property=DevicePolicy=strict", argv)
+        self.assertEqual(self.process.call_args.kwargs["timeout"], 190)
+
+    def test_artifact_copy_cannot_bypass_the_container_worker_precondition(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/radv", "running": True, "pid": 12}
+        runner = MaintenanceCommandRunner(self.config, runner=self.process, available=False, in_collector=False)
+        with self.assertRaisesRegex(RuntimeError, "trusted root systemd"):
+            runner.copy_from_container(identity, "/runtime", "/cache")
+        with self.assertRaisesRegex(RuntimeError, "trusted root systemd"):
+            runner.copy_to_container(identity, "/cache/file.deb", "/runtime/file.deb", "a" * 64)
+        self.process.assert_not_called()
+
+    def test_namespace_helper_pins_all_handles_without_joining_container_cgroup(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
+        seen = SimpleNamespace(stdout=json.dumps(identity))
+        with patch("smart_patch.maintenance_resources.os.geteuid", return_value=0), \
+                patch("smart_patch.maintenance_resources._trusted_executable", return_value=True), \
+                patch("smart_patch.maintenance_resources._process_start", return_value="stable-start"), \
+                patch("smart_patch.maintenance_resources._process_security", return_value={"Seccomp": 0, "NoNewPrivs": 0, "profile": "unconfined"}), \
+                patch.object(Path, "read_text", return_value="0 0 4294967295"), \
+                patch("smart_patch.maintenance_resources.os.open", side_effect=range(10, 30)) as opened, \
+                patch("smart_patch.maintenance_resources.os.close") as closed, \
+                patch("smart_patch.maintenance_resources._run_in_namespaces", return_value=0) as entered, \
+                patch("smart_patch.maintenance_resources.subprocess.run", side_effect=[seen, seen]) as run:
+            self.assertEqual(_container_entry(identity, "/var/tmp", ["dpkg-query", "-W", "-f=${Version}", "socat"]), 0)
+        self.assertEqual(entered.call_args.args[1:4], (list(range(10, 15)), 15, 17))
+        namespaces = [call.args[0] for call in opened.call_args_list[:5]]
+        self.assertEqual(namespaces, ["/proc/12/ns/" + name for name in ("mnt", "uts", "ipc", "net", "pid")])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(closed.call_count, opened.call_count)
+
+    def test_namespace_helper_rejects_pid_restart_before_running_command(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
+        before = SimpleNamespace(stdout=json.dumps(identity))
+        after = SimpleNamespace(stdout=json.dumps({**identity, "pid": 14}))
+        with patch("smart_patch.maintenance_resources.os.geteuid", return_value=0), \
+                patch("smart_patch.maintenance_resources._trusted_executable", return_value=True), \
+                patch("smart_patch.maintenance_resources._process_start", return_value="stable-start"), \
+                patch("smart_patch.maintenance_resources._process_security", return_value={"Seccomp": 0, "NoNewPrivs": 0, "profile": "unconfined"}), \
+                patch.object(Path, "read_text", return_value="0 0 4294967295"), \
+                patch("smart_patch.maintenance_resources.os.open", side_effect=range(10, 30)), \
+                patch("smart_patch.maintenance_resources.os.close"), \
+                patch("smart_patch.maintenance_resources.subprocess.run", side_effect=[before, after]) as run:
+            with self.assertRaisesRegex(ValueError, "process changed"):
+                _container_entry(identity, "/", ["apt-get", "install", "socat=1.1"])
+        self.assertEqual(run.call_count, 2)
+
+    def test_namespace_helper_rejects_remapped_root(self):
+        identity = {"id": "a" * 64, "image": "sha256:" + "b" * 64, "name": "/pmon", "running": True, "pid": 12}
+        with patch("smart_patch.maintenance_resources.os.geteuid", return_value=0), \
+                patch("smart_patch.maintenance_resources._trusted_executable", return_value=True), \
+                patch("smart_patch.maintenance_resources._process_start", return_value="stable-start"), \
+                patch.object(Path, "read_text", return_value="0 100000 65536"), \
+                patch("smart_patch.maintenance_resources.os.open") as opened, \
+                patch("smart_patch.maintenance_resources.subprocess.run", return_value=SimpleNamespace(stdout=json.dumps(identity))):
+            with self.assertRaisesRegex(ValueError, "remapped"):
+                _container_entry(identity, "/", ["apt-get", "install", "socat=1.1"])
+        opened.assert_not_called()
+
+    def test_seccomp_and_lsm_constraints_are_never_silently_removed(self):
+        unconfined = {"Seccomp": 0, "NoNewPrivs": 0, "profile": "unconfined"}
+        for changed in ({"Seccomp": 2}, {"profile": "docker-default (enforce)"}):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "cannot preserve"):
+                _compatible_security({**unconfined, **changed}, unconfined)
+
+    def test_namespace_entry_forks_for_pid_namespace_and_retains_outer_cgroup(self):
+        libc = Mock()
+        libc.setns.return_value = 0
+        with patch("smart_patch.maintenance_resources.os.fork", return_value=42) as fork, \
+                patch("smart_patch.maintenance_resources.os.waitpid", return_value=(42, 0)) as wait:
+            self.assertEqual(_run_in_namespaces(libc, [10, 11, 12, 13, 14], 15, 15, {}, {}, ["true"], 1024), 0)
+        self.assertEqual([call.args for call in libc.setns.call_args_list], [(10, 0), (11, 0), (12, 0), (13, 0), (14, 0)])
+        fork.assert_called_once()
+        wait.assert_called_once_with(42, 0)
+
+    def test_host_privileges_and_handles_are_dropped_before_any_container_exec(self):
+        libc = Mock()
+        libc.prctl.return_value = 0
+        masks = []
+        def capture_capset(header, data):
+            masks.append((data._obj[0].effective, data._obj[0].permitted, data._obj[0].inheritable))
+            return 0
+        libc.capset.side_effect = capture_capset
+        target = {"CapBnd": 3, "CapPrm": 3, "CapEff": 1}
+        helper = {"CapBnd": 255, "CapPrm": 255, "CapEff": 255}
+        events = []
+        with patch("smart_patch.maintenance_resources.os.fchdir", side_effect=lambda fd: events.append(("cwd", fd))), \
+                patch("smart_patch.maintenance_resources.os.chroot", side_effect=lambda path: events.append(("root", path))), \
+                patch("smart_patch.maintenance_resources.os.setgroups", side_effect=lambda groups: events.append(("groups", groups))), \
+                patch("smart_patch.maintenance_resources.os.setgid"), \
+                patch("smart_patch.maintenance_resources.os.setuid"), \
+                patch("smart_patch.maintenance_resources.os.closerange", side_effect=lambda a, b: events.append(("close", a, b))), \
+                patch("smart_patch.maintenance_resources.os.execvpe", side_effect=lambda *args: events.append(("exec", args))) as execute:
+            _container_exec(libc, 15, 17, target, helper, ["dpkg-query", "-W", "socat"], 1024)
+        self.assertEqual(masks, [(1, 1, 0)])
+        dropped = [call.args[1] for call in libc.prctl.call_args_list if call.args[0] == 24]
+        self.assertEqual(dropped, list(range(1, 8)))
+        self.assertIn((47, 4, 0, 0, 0), [call.args for call in libc.prctl.call_args_list])
+        self.assertIn((38, 1, 0, 0, 0), [call.args for call in libc.prctl.call_args_list])
+        self.assertEqual(events[:4], [("cwd", 15), ("root", "."), ("cwd", 17), ("groups", [])])
+        self.assertEqual(events[-2][0], "close")
+        self.assertEqual(events[-1][0], "exec")
+        self.assertEqual(execute.call_args.args[2], {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root"})
 
 
 if __name__ == "__main__":
